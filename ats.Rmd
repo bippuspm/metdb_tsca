@@ -1,0 +1,65 @@
+---
+title: "AirToxScreen Data Analysis"
+author: "Paige Varner"
+date: "2025-04-18"
+output: html_document
+---
+
+
+#load libraries
+```{r}
+library("dplyr")
+library("tidyr")
+library("bigrquery")
+library("DBI")
+library("pheatmap")
+library("RColorBrewer")
+library("Rmisc")
+library("stats")
+library("rstatix")
+library("ggplot2")
+library("car")
+detach(package:Rmisc)
+detach(package:plyr)
+```
+
+
+
+#query data from BQ (just for chemicals of interest)
+```{r}
+# set up database connection
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "edf-aq-data",
+  dataset = "airtoxscreen",)
+
+SQL = "	
+	SELECT *
+	FROM `2020_ambient_concentrations_bysource_bychemical`
+  WHERE pollutant_name IN ('BENZENE', 'ETHYLBENZENE', 'STYRENE', 'NAPHTHALENE')"
+
+ats = dbGetQuery(con,SQL)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
