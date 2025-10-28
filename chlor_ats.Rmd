@@ -1,0 +1,1020 @@
+---
+title: "HI calculations for chlorinated solvents"
+author: "Paige Varner"
+date: "2025-05-21"
+output: html_document
+---
+
+
+#load libraries
+```{r}
+library("dplyr")
+library("tidyr")
+library("bigrquery")
+library("DBI")
+library("pheatmap")
+library("RColorBrewer")
+library("Rmisc")
+library("stats")
+library("rstatix")
+library("ggplot2")
+library("car")
+library("arrow")
+library("progressr")
+library("purrr")
+library("readr")
+library("haven")
+library("stringr")
+detach(package:Rmisc)
+detach(package:plyr)
+
+filtblocks = read.csv("~/TSCA/CRA/metdb_tsca/data/filtblocks_chlor.csv")
+```
+
+
+#database connection
+```{r}
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "edf-aq-data",
+  dataset = "airtoxscreen",)
+
+bq_auth(email = NA)
+```
+
+
+#upload a filtblocks table to BQ to filter downstream analysis for those blocks of interest
+```{r}
+project <- "edf-aq-data"
+dataset <- "TSCA"  
+table   <- "filtblocks_chlor"
+
+tbl <- bq_table(project, dataset, table)
+
+# Pad GEOIDs and upload filtblocks_chlor
+filtblocks_chlor_upload <- filtblocks %>%
+  mutate(GEOID = str_pad(as.character(GEOID), width = 15, side = "left", pad = "0")) %>%
+  select(GEOID)
+
+stopifnot(all(nchar(filtblocks_chlor_upload$GEOID) == 15))
+
+bq_table_upload(
+  x = tbl,
+  values = filtblocks_chlor_upload,
+  create_disposition = "CREATE_IF_NEEDED",
+  write_disposition = "WRITE_TRUNCATE",
+  fields = list(
+    bq_field("GEOID", "STRING")
+  )
+)
+
+```
+
+
+#pull summary information on HIs (note: the N in these summaries is for block + endpoint combinations)
+```{r}
+# ---  Overall summary table ---
+SQL <- "
+SELECT 
+  'HI_tot' AS HI_type,
+  MIN(HI_tot) AS min,
+  MAX(HI_tot) AS max,
+  AVG(HI_tot) AS mean,
+  APPROX_QUANTILES(HI_tot, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot) AS std_dev,
+  STDDEV(HI_tot) / SQRT(COUNT(HI_tot)) AS std_error,
+  COUNT(HI_tot) AS n
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+
+UNION ALL
+
+SELECT
+  'HI_pt',
+  MIN(HI_pt),
+  MAX(HI_pt),
+  AVG(HI_pt),
+  APPROX_QUANTILES(HI_pt, 2)[OFFSET(1)],
+  STDDEV(HI_pt),
+  STDDEV(HI_pt) / SQRT(COUNT(HI_pt)),
+  COUNT(HI_pt)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+
+UNION ALL
+
+SELECT
+  'HI_other',
+  MIN(HI_other),
+  MAX(HI_other),
+  AVG(HI_other),
+  APPROX_QUANTILES(HI_other, 2)[OFFSET(1)],
+  STDDEV(HI_other),
+  STDDEV(HI_other) / SQRT(COUNT(HI_other)),
+  COUNT(HI_other)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID;
+"
+
+chlor_HI_summary <- dbGetQuery(con, SQL)
+write.csv(chlor_HI_summary, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HIsummary.csv")
+
+
+# ---  EPA region summary table ---
+SQL <- "
+SELECT
+  epa_region AS group_value,
+  'HI_tot' AS HI_type,
+  MIN(HI_tot) AS min,
+  MAX(HI_tot) AS max,
+  AVG(HI_tot) AS mean,
+  APPROX_QUANTILES(HI_tot, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot) AS std_dev,
+  STDDEV(HI_tot) / SQRT(COUNT(HI_tot)) AS std_error,
+  COUNT(HI_tot) AS n
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY epa_region
+
+UNION ALL
+
+SELECT
+  epa_region,
+  'HI_pt',
+  MIN(HI_pt),
+  MAX(HI_pt),
+  AVG(HI_pt),
+  APPROX_QUANTILES(HI_pt, 2)[OFFSET(1)],
+  STDDEV(HI_pt),
+  STDDEV(HI_pt) / SQRT(COUNT(HI_pt)),
+  COUNT(HI_pt)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY epa_region
+
+UNION ALL
+
+SELECT
+  epa_region,
+  'HI_other',
+  MIN(HI_other),
+  MAX(HI_other),
+  AVG(HI_other),
+  APPROX_QUANTILES(HI_other, 2)[OFFSET(1)],
+  STDDEV(HI_other),
+  STDDEV(HI_other) / SQRT(COUNT(HI_other)),
+  COUNT(HI_other)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY epa_region
+ORDER BY group_value, HI_type;
+"
+
+chlor_HI_summary_region <- dbGetQuery(con, SQL)
+write.csv(chlor_HI_summary_region, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HIsummary_region.csv")
+
+
+# ---  State summary table ---
+SQL <- "
+SELECT
+  state AS group_value,
+  'HI_tot' AS HI_type,
+  MIN(HI_tot) AS min,
+  MAX(HI_tot) AS max,
+  AVG(HI_tot) AS mean,
+  APPROX_QUANTILES(HI_tot, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot) AS std_dev,
+  STDDEV(HI_tot) / SQRT(COUNT(HI_tot)) AS std_error,
+  COUNT(HI_tot) AS n
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY state
+
+UNION ALL
+
+SELECT
+  state,
+  'HI_pt',
+  MIN(HI_pt),
+  MAX(HI_pt),
+  AVG(HI_pt),
+  APPROX_QUANTILES(HI_pt, 2)[OFFSET(1)],
+  STDDEV(HI_pt),
+  STDDEV(HI_pt) / SQRT(COUNT(HI_pt)),
+  COUNT(HI_pt)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY state
+
+UNION ALL
+
+SELECT
+  state,
+  'HI_other',
+  MIN(HI_other),
+  MAX(HI_other),
+  AVG(HI_other),
+  APPROX_QUANTILES(HI_other, 2)[OFFSET(1)],
+  STDDEV(HI_other),
+  STDDEV(HI_other) / SQRT(COUNT(HI_other)),
+  COUNT(HI_other)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY state
+ORDER BY group_value, HI_type;
+"
+
+chlor_HI_summary_state <- dbGetQuery(con, SQL)
+write.csv(chlor_HI_summary_state, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HIsummary_state.csv")
+
+
+# ---  Endpoint summary table ---
+SQL <- "
+SELECT
+  endpoint AS group_value,
+  'HI_tot' AS HI_type,
+  MIN(HI_tot) AS min,
+  MAX(HI_tot) AS max,
+  AVG(HI_tot) AS mean,
+  APPROX_QUANTILES(HI_tot, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot) AS std_dev,
+  STDDEV(HI_tot) / SQRT(COUNT(HI_tot)) AS std_error,
+  COUNT(HI_tot) AS n
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY endpoint
+
+UNION ALL
+
+SELECT
+  endpoint,
+  'HI_pt',
+  MIN(HI_pt),
+  MAX(HI_pt),
+  AVG(HI_pt),
+  APPROX_QUANTILES(HI_pt, 2)[OFFSET(1)],
+  STDDEV(HI_pt),
+  STDDEV(HI_pt) / SQRT(COUNT(HI_pt)),
+  COUNT(HI_pt)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY endpoint
+
+UNION ALL
+
+SELECT
+  endpoint,
+  'HI_other',
+  MIN(HI_other),
+  MAX(HI_other),
+  AVG(HI_other),
+  APPROX_QUANTILES(HI_other, 2)[OFFSET(1)],
+  STDDEV(HI_other),
+  STDDEV(HI_other) / SQRT(COUNT(HI_other)),
+  COUNT(HI_other)
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f ON t.block = f.GEOID
+GROUP BY endpoint
+ORDER BY group_value, HI_type;
+"
+
+chlor_HI_summary_endpoint <- dbGetQuery(con, SQL)
+write.csv(chlor_HI_summary_endpoint, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HIsummary_endpoint.csv")
+```
+
+
+
+#delta for each pollutant
+```{r}
+# overall deltas
+SQL <- "
+SELECT
+  hq.pollutant_name,
+
+  AVG(hq.HQ_tot) AS avg_HQ_tot,
+  AVG(hi.HI_tot) AS avg_HI_tot,
+  SAFE_DIVIDE(AVG(hi.HI_tot) - AVG(hq.HQ_tot), 1) AS delta_avg_tot,
+
+  AVG(hq.HQ_pt) AS avg_HQ_pt,
+  AVG(hi.HI_pt) AS avg_HI_pt,
+  SAFE_DIVIDE(AVG(hi.HI_pt) - AVG(hq.HQ_pt), 1) AS delta_avg_pt,
+
+  AVG(hq.HQ_other) AS avg_HQ_other,
+  AVG(hi.HI_other) AS avg_HI_other,
+  SAFE_DIVIDE(AVG(hi.HI_other) - AVG(hq.HQ_other), 1) AS delta_avg_other,
+
+  COUNT(*) AS n
+
+FROM `edf-aq-data.TSCA.chlor_ATS_HQs` AS hq
+JOIN `edf-aq-data.TSCA.chlor_ATS_HIs` AS hi
+  ON hq.block = hi.block
+     AND hq.endpoint = hi.endpoint
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON hq.block = f.GEOID
+
+GROUP BY hq.pollutant_name
+ORDER BY hq.pollutant_name
+"
+
+chlor_pollutant_avg_deltas <- dbGetQuery(con, SQL)
+write.csv(chlor_pollutant_avg_deltas, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/avg_deltas.csv")
+
+
+# deltas for blocks with HIs > 1
+SQL <- "
+WITH blocks_with_high_HI AS (
+  SELECT DISTINCT block, endpoint
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+    ON t.block = f.GEOID
+  WHERE HI_tot > 1 OR HI_pt > 1 OR HI_other > 1
+)
+
+SELECT
+  hq.pollutant_name,
+
+  AVG(hq.HQ_tot) AS avg_HQ_tot,
+  AVG(hi.HI_tot) AS avg_HI_tot,
+  SAFE_DIVIDE(AVG(hi.HI_tot) - AVG(hq.HQ_tot), 1) AS delta_avg_tot,
+
+  AVG(hq.HQ_pt) AS avg_HQ_pt,
+  AVG(hi.HI_pt) AS avg_HI_pt,
+  SAFE_DIVIDE(AVG(hi.HI_pt) - AVG(hq.HQ_pt), 1) AS delta_avg_pt,
+
+  AVG(hq.HQ_other) AS avg_HQ_other,
+  AVG(hi.HI_other) AS avg_HI_other,
+  SAFE_DIVIDE(AVG(hi.HI_other) - AVG(hq.HQ_other), 1) AS delta_avg_other,
+
+  COUNT(*) AS n
+
+FROM `edf-aq-data.TSCA.chlor_ATS_HQs` AS hq
+JOIN `edf-aq-data.TSCA.chlor_ATS_HIs` AS hi
+  ON hq.block = hi.block
+     AND hq.endpoint = hi.endpoint
+JOIN blocks_with_high_HI b
+  ON hq.block = b.block
+     AND hq.endpoint = b.endpoint
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON hq.block = f.GEOID
+
+GROUP BY hq.pollutant_name
+ORDER BY hq.pollutant_name
+"
+
+chlor_pollutant_avg_deltas_1 <- dbGetQuery(con, SQL)
+write.csv(chlor_pollutant_avg_deltas_1, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/avg_deltas_HI1.csv")
+
+
+# deltas for blocks with HIs > 0.1
+SQL <- "
+WITH blocks_with_high_HI AS (
+  SELECT DISTINCT block, endpoint
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+    ON t.block = f.GEOID
+  WHERE HI_tot > 0.1 OR HI_pt > 0.1 OR HI_other > 0.1
+)
+
+SELECT
+  hq.pollutant_name,
+
+  AVG(hq.HQ_tot) AS avg_HQ_tot,
+  AVG(hi.HI_tot) AS avg_HI_tot,
+  SAFE_DIVIDE(AVG(hi.HI_tot) - AVG(hq.HQ_tot), 1) AS delta_avg_tot,
+
+  AVG(hq.HQ_pt) AS avg_HQ_pt,
+  AVG(hi.HI_pt) AS avg_HI_pt,
+  SAFE_DIVIDE(AVG(hi.HI_pt) - AVG(hq.HQ_pt), 1) AS delta_avg_pt,
+
+  AVG(hq.HQ_other) AS avg_HQ_other,
+  AVG(hi.HI_other) AS avg_HI_other,
+  SAFE_DIVIDE(AVG(hi.HI_other) - AVG(hq.HQ_other), 1) AS delta_avg_other,
+
+  COUNT(*) AS n
+
+FROM `edf-aq-data.TSCA.chlor_ATS_HQs` AS hq
+JOIN `edf-aq-data.TSCA.chlor_ATS_HIs` AS hi
+  ON hq.block = hi.block
+     AND hq.endpoint = hi.endpoint
+JOIN blocks_with_high_HI b
+  ON hq.block = b.block
+     AND hq.endpoint = b.endpoint
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON hq.block = f.GEOID
+
+GROUP BY hq.pollutant_name
+ORDER BY hq.pollutant_name
+"
+
+chlor_pollutant_avg_deltas_01 <- dbGetQuery(con, SQL)
+write.csv(chlor_pollutant_avg_deltas_01, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/avg_deltas_HI01.csv")
+```
+
+
+#CDFs for HI_tot and HI_pt
+```{r}
+# --- 1. Pull the data ---
+project_id <- "edf-aq-data"
+
+SQL <- "
+SELECT
+  t.block,
+  t.endpoint,
+  t.HI_tot,
+  t.HI_pt
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON t.block = f.GEOID
+"
+
+chlor_ATS_HIs_filtered <- bq_project_query(project_id, SQL) %>%
+  bq_table_download()
+
+# --- 2. Reshape for plotting ---
+chlor_long <- chlor_ATS_HIs_filtered %>%
+  pivot_longer(
+    cols = c(HI_tot, HI_pt),
+    names_to = "HI_type",
+    values_to = "HI_value"
+  )
+
+# --- 3. Pre-compute CDF ---
+chlor_cdf <- chlor_long %>%
+  group_by(endpoint, HI_type) %>%
+  arrange(HI_value) %>%
+  mutate(cdf = row_number() / n()) %>%
+  ungroup()
+
+#Optional: thin points for plotting (e.g., keep every 10th point)
+chlor_cdf_sample <- chlor_cdf %>%
+  group_by(endpoint, HI_type) %>%
+  slice(seq(1, n(), by = 10)) %>%
+  ungroup()
+
+# --- 4. Plot ---
+cdf_plot <- ggplot(chlor_cdf_sample, aes(x = HI_value, y = cdf)) +
+  geom_line() +
+  # vertical reference lines for thresholds
+  geom_vline(xintercept = c(0.1, 1), linetype = "dotted", color = "black") +
+  scale_x_log10() +
+  labs(
+    title = "CDF of HI_tot and HI_pt",
+    x = "HI value (log scale)",
+    y = "P(HI ≤ x)"
+  ) +
+  facet_wrap(~HI_type, scales = "free_y") +
+  theme_minimal(base_size = 14)
+
+cdf_plot
+
+ggsave(filename = "chlor_cdf.png", device = "png", plot = cdf_plot, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/", width = 7, height = 5)
+
+```
+
+
+
+#######################################
+
+### analysis with HI threshold of 1 ###
+
+#######################################
+
+
+#get count of blocks with various HIs above 1
+```{r}
+SQL <- "
+WITH filtered_HIs AS (
+  SELECT *
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+    ON t.block = f.GEOID
+)
+
+SELECT
+  'HI_tot' AS HI_type,
+  COUNT(DISTINCT CASE WHEN HI_tot > 1 THEN block END) AS unique_blocks_above_1,
+  COUNT(DISTINCT block) AS total_unique_blocks,
+  COUNT(CASE WHEN HI_tot > 1 THEN 1 END) AS total_exceedances,
+  COUNT(*) AS total_block_endpoint_combos
+FROM filtered_HIs
+
+UNION ALL
+
+SELECT
+  'HI_pt',
+  COUNT(DISTINCT CASE WHEN HI_pt > 1 THEN block END),
+  COUNT(DISTINCT block),
+  COUNT(CASE WHEN HI_pt > 1 THEN 1 END),
+  COUNT(*)
+FROM filtered_HIs
+
+UNION ALL
+
+SELECT
+  'HI_other',
+  COUNT(DISTINCT CASE WHEN HI_other > 1 THEN block END),
+  COUNT(DISTINCT block),
+  COUNT(CASE WHEN HI_other > 1 THEN 1 END),
+  COUNT(*)
+FROM filtered_HIs;
+"
+
+chlor_blocks_HIsabove1 <- dbGetQuery(con, SQL)
+
+write.csv(chlor_blocks_HIsabove1, 
+          file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/blocks_HIsabove1_summary.csv",
+          row.names = FALSE)
+
+```
+
+
+#pull df of HIs >1 for further analysis and HQs for those blocks
+```{r}
+# pull blocks with HIs > 1 filtered by filtblocks_chlor
+SQL = "
+SELECT t.*
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON t.block = f.GEOID
+WHERE HI_tot > 1 OR HI_pt > 1 OR HI_other > 1;
+"
+
+chlor_exceedances = dbGetQuery(con, SQL)
+
+# pull HQ data for those blocks
+block_ids = unique(chlor_exceedances$block)
+
+block_list_sql = paste0("'", block_ids, "'", collapse = ", ")
+
+SQL = paste0("
+  SELECT *
+  FROM `edf-aq-data.TSCA.chlor_ATS_HQs`
+  WHERE block IN (", block_list_sql, ")
+")
+
+chlor_HQs_HIexceedances = dbGetQuery(con, SQL)
+
+```
+
+
+# how many blocks exceed more than one health endpoint threshold
+```{r}
+blocks_mult_endpoints <- chlor_exceedances %>%
+  group_by(block) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(unique(endpoint), collapse = ", ")
+  ) %>%
+  filter(n_endpoints_exceeding > 1)
+
+chlor_mult_endpoints <- chlor_exceedances %>%
+  semi_join(blocks_mult_endpoints, by = "block") %>%
+  left_join(blocks_mult_endpoints, by = "block")
+
+write.csv(blocks_mult_endpoints, 
+          file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/blocks_mult_endpoints.csv")
+
+```
+
+
+#what chemicals are contributing to HI exceedances - and would these exceedances exist without considering cumulative risk?
+```{r}
+# join HQ and HI datasets together
+chlor_exceedances_with_HQs <- chlor_exceedances %>%
+  left_join(
+    chlor_HQs_HIexceedances %>% select(block, endpoint, HQ_tot, HQ_pt, HQ_other, pollutant_name),
+    by = c("block", "endpoint")
+  )
+
+# filter for blocks where HIs are greater than 1 but HQs are not (no blocks of this type - no cumulative risk consideration)
+chlor_exceedances_HI_only <- chlor_exceedances_with_HQs %>%
+  group_by(block, endpoint) %>%
+  filter(
+    (any(HI_tot > 1) & all(is.na(HQ_tot) | HQ_tot <= 1)) |
+    (any(HI_pt > 1) & all(is.na(HQ_pt) | HQ_pt <= 1)) |
+    (any(HI_other > 1) & all(is.na(HQ_other) | HQ_other <= 1))
+  ) %>%
+  mutate(
+    HI_exceeding_type = case_when(
+      HI_tot > 1 & (is.na(HQ_tot) | HQ_tot <= 1) ~ "HI_tot",
+      HI_pt  > 1 & (is.na(HQ_pt)  | HQ_pt  <= 1) ~ "HI_pt",
+      HI_other > 1 & (is.na(HQ_other) | HQ_other <= 1) ~ "HI_other",
+      TRUE ~ NA_character_
+    ),
+    max_HI = pmax(HI_tot, HI_pt, HI_other, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+```
+
+
+#graph average HQs for each endpoint that was exceeded in any block group to see which chemicals contribute 
+```{r}
+# get averages of HQs for each chemical/endpoint combination for graphing
+HQ_averages <- chlor_exceedances_with_HQs %>%
+  group_by(endpoint, pollutant_name) %>%
+  summarise(
+    avg_HQ_tot   = mean(HQ_tot, na.rm = TRUE),
+    avg_HQ_pt    = mean(HQ_pt, na.rm = TRUE),
+    avg_HQ_other = mean(HQ_other, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+write.csv(HQ_averages, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/HQ_averages.csv")
+
+
+# stacked bar plot for HQ_tot
+chlor_HQtot_bar = ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_tot, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Average HQ_tot by Endpoint and Pollutant",
+    x = "Endpoint",
+    y = "Average HQ_tot",
+    fill = "Pollutant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+chlor_HQtot_bar
+
+ggsave(filename = "bar_avgHQtot_endpoints.png", device = "png", plot = chlor_HQtot_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/", width = 7, height = 5)
+
+# stacked bar plot for HQ_pt
+chlor_HQpt_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_pt, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Average HQ_pt by Endpoint and Pollutant",
+    x = "Endpoint",
+    y = "Average HQ_pt",
+    fill = "Pollutant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+chlor_HQpt_bar
+
+ggsave(filename = "bar_avgHQpt_endpoints.png", device = "png", plot = chlor_HQpt_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/", width = 7, height = 5)
+
+# stacked bar plot for HQ_other
+chlor_HQother_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_other, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Average HQ_other by Endpoint and Pollutant",
+    x = "Endpoint",
+    y = "Average HQ_other",
+    fill = "Pollutant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+chlor_HQother_bar
+
+ggsave(filename = "bar_avgHQother_endpoints.png", device = "png", plot = chlor_HQother_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/", width = 7, height = 5)
+
+```
+
+
+#population counts for exceedances
+```{r}
+# Get total population of all assessed ATS blocks (filtered)
+SQL <- "
+SELECT
+  SUM(population) AS total_assessed_population
+FROM (
+  SELECT DISTINCT t.block, t.population
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+    ON t.block = f.GEOID
+)
+"
+
+ats_all_blocks_chlor <- dbGetQuery(con, SQL)
+
+### Population counts for exceeding blocks (HI > 1)
+
+# Ensure GEOID in filtblocks_chlor is character with 15 digits
+filtblocks_chlor <- filtblocks %>%
+  mutate(GEOID = str_pad(as.character(GEOID), width = 15, side = "left", pad = "0"))
+
+# Filter chlor_exceedances to only blocks in filtblocks_chlor
+chlor_exceedances_filtered <- chlor_exceedances %>%
+  semi_join(filtblocks_chlor, by = c("block" = "GEOID"))
+
+# Summarize population for blocks with HI > 1 (unique blocks only)
+pop_summary_by_source_chlor <- chlor_exceedances_filtered %>%
+  pivot_longer(
+    cols = c(HI_tot, HI_pt, HI_other),
+    names_to = "HI_type",
+    values_to = "HI_value"
+  ) %>%
+  filter(HI_value > 1) %>%
+  distinct(HI_type, block, population) %>%   # <-- ensure each block counted once per HI type
+  group_by(HI_type) %>%
+  summarise(
+    total_pop = sum(population, na.rm = TRUE),
+    avg_pop   = mean(population, na.rm = TRUE),
+    n_blocks  = n_distinct(block),
+    .groups = "drop"
+  )
+
+write.csv(
+  pop_summary_by_source_chlor, 
+  "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/population_summary.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+#######################################
+
+### analysis with HI threshold of 0.1 
+
+#######################################
+
+
+# Count of blocks with various HIs above 0.1 for further analysis and HQs for those blocks
+```{r}
+SQL <- "
+WITH filtered_HIs AS (
+  SELECT *
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+    ON t.block = f.GEOID
+)
+
+SELECT
+  'HI_tot' AS HI_type,
+  COUNT(DISTINCT CASE WHEN HI_tot > 0.1 THEN block END) AS unique_blocks_above_01,
+  COUNT(DISTINCT block) AS total_unique_blocks,
+  COUNT(CASE WHEN HI_tot > 0.1 THEN 1 END) AS total_exceedances,
+  COUNT(*) AS total_block_endpoint_combos
+FROM filtered_HIs
+
+UNION ALL
+
+SELECT
+  'HI_pt',
+  COUNT(DISTINCT CASE WHEN HI_pt > 0.1 THEN block END),
+  COUNT(DISTINCT block),
+  COUNT(CASE WHEN HI_pt > 0.1 THEN 1 END),
+  COUNT(*)
+FROM filtered_HIs
+
+UNION ALL
+
+SELECT
+  'HI_other',
+  COUNT(DISTINCT CASE WHEN HI_other > 0.1 THEN block END),
+  COUNT(DISTINCT block),
+  COUNT(CASE WHEN HI_other > 0.1 THEN 1 END),
+  COUNT(*)
+FROM filtered_HIs;
+"
+
+chlor_blocks_HIsabove01 <- dbGetQuery(con, SQL)
+
+write.csv(chlor_blocks_HIsabove01, 
+          file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/blocks_HIsabove01_summary.csv",
+          row.names = FALSE)
+
+```
+
+
+# Pull df of HIs > 0.1
+```{r}
+# --- pull blocks with HIs > 0.1 filtered by filtblocks_chlor ---
+SQL = "
+SELECT t.*
+FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON t.block = f.GEOID
+WHERE HI_tot > 0.1 OR HI_pt > 0.1 OR HI_other > 0.1;
+"
+
+chlor_exceedances = dbGetQuery(con, SQL)
+
+# --- pull HQ data for those blocks by joining to filtblocks in BQ ---
+SQL = "
+SELECT hq.*
+FROM `edf-aq-data.TSCA.chlor_ATS_HQs` hq
+JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+  ON hq.block = f.GEOID
+JOIN (
+  SELECT block, endpoint
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs`
+  WHERE HI_tot > 0.1 OR HI_pt > 0.1 OR HI_other > 0.1
+) t
+  ON hq.block = t.block AND hq.endpoint = t.endpoint;
+"
+
+chlor_HQs_HIexceedances = dbGetQuery(con, SQL)
+
+```
+
+
+# Blocks exceeding more than one endpoint
+```{r}
+blocks_mult_endpoints <- chlor_exceedances %>%
+  group_by(block) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(unique(endpoint), collapse = ", ")
+  ) %>%
+  filter(n_endpoints_exceeding > 1)  
+
+chlor_mult_endpoints <- chlor_exceedances %>%
+  semi_join(blocks_mult_endpoints, by = "block") %>%
+  left_join(blocks_mult_endpoints, by = "block")
+
+write.csv(blocks_mult_endpoints, 
+          file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/blocks_mult_endpoints.csv")
+
+```
+
+
+# Chemicals contributing to HI exceedances
+```{r}
+# join HQ and HI datasets together
+chlor_exceedances_with_HQs <- chlor_exceedances %>%
+  left_join(
+    chlor_HQs_HIexceedances %>% select(block, endpoint, HQ_tot, HQ_pt, HQ_other, pollutant_name),
+    by = c("block", "endpoint")
+  )
+
+# filter for blocks where HIs are greater than 0.1 but HQs are not
+chlor_exceedances_HI_only <- chlor_exceedances_with_HQs %>%
+  group_by(block, endpoint) %>%
+  filter(
+    (any(HI_tot > 0.1) & all(is.na(HQ_tot) | HQ_tot <= 0.1)) |
+    (any(HI_pt > 0.1) & all(is.na(HQ_pt) | HQ_pt <= 0.1)) |
+    (any(HI_other > 0.1) & all(is.na(HQ_other) | HQ_other <= 0.1))
+  ) %>%
+  mutate(
+    HI_exceeding_type = case_when(
+      HI_tot > 0.1 & (is.na(HQ_tot) | HQ_tot <= 0.1) ~ "HI_tot",
+      HI_pt  > 0.1 & (is.na(HQ_pt)  | HQ_pt  <= 0.1) ~ "HI_pt",
+      HI_other > 0.1 & (is.na(HQ_other) | HQ_other <= 0.1) ~ "HI_other",
+      TRUE ~ NA_character_
+    ),
+    max_HI = pmax(HI_tot, HI_pt, HI_other, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# select top 10 blocks for each endpoint by max_HI
+top10_blocks_per_endpoint <- chlor_exceedances_HI_only %>%
+  group_by(endpoint, block) %>%
+  summarize(max_HI_block = max(max_HI, na.rm = TRUE), .groups = "drop") %>%
+  group_by(endpoint) %>%
+  arrange(desc(max_HI_block)) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+chlor_exceedances_HI_only_top10 <- chlor_exceedances_HI_only %>%
+  filter(block %in% top10_blocks_per_endpoint$block)
+
+write.csv(chlor_exceedances_HI_only_top10, 
+          file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/block_combinedexceedances_top10_per_endpoint.csv")
+
+# create generic block labels within each endpoint for readability
+chlor_exceedances_HI_only_top10 <- chlor_exceedances_HI_only_top10 %>%
+  group_by(endpoint) %>%
+  mutate(block_label = paste0("Block ", dense_rank(desc(max_HI)))) %>%
+  ungroup()
+
+# graph 
+chlor_HQblocks_bar <- ggplot(chlor_exceedances_HI_only_top10, 
+                              aes(x = block_label, y = HQ_tot, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ endpoint, scales = "free_x") +
+  labs(
+    title = "HQ_tot by Pollutant and Top 10 Blocks per Endpoint (HI > 0.1)",
+    x = "Block (generic labels)",
+    y = "HQ_tot",
+    fill = "Pollutant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+chlor_HQblocks_bar
+
+ggsave(filename = "bar_HQtot_blocks.png", device = "png", plot = chlor_HQblocks_bar, 
+       path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+
+```
+
+
+#graph average HQs for each endpoint that was exceeded in any block group to see which chemicals contribute 
+```{r}
+# HQ averages
+HQ_averages <- chlor_exceedances_with_HQs %>%
+  group_by(endpoint, pollutant_name) %>%
+  summarise(
+    avg_HQ_tot   = mean(HQ_tot, na.rm = TRUE),
+    avg_HQ_pt    = mean(HQ_pt, na.rm = TRUE),
+    avg_HQ_other = mean(HQ_other, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+write.csv(HQ_averages, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/HQ_averages.csv")
+
+# stacked bar plot for HQ_bar
+chlor_HQtot_bar = ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_tot, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average HQ_tot by Endpoint and Pollutant", x = "Endpoint", y = "Average HQ_tot", fill = "Pollutant") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+chlor_HQtot_bar
+
+ggsave(filename = "bar_avgHQtot_endpoints.png", device = "png", plot = chlor_HQtot_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+
+# stacked bar plot for HQ_pt
+chlor_HQpt_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_pt, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average HQ_pt by Endpoint and Pollutant", x = "Endpoint", y = "Average HQ_pt", fill = "Pollutant") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+chlor_HQpt_bar
+
+ggsave(filename = "bar_avgHQpt_endpoints.png", device = "png", plot = chlor_HQpt_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+
+# stacked bar plot for HQ_other
+chlor_HQother_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_other, fill = pollutant_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average HQ_other by Endpoint and Pollutant", x = "Endpoint", y = "Average HQ_other", fill = "Pollutant") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+chlor_HQother_bar
+
+ggsave(filename = "bar_avgHQother_endpoints.png", device = "png", plot = chlor_HQother_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+
+```
+
+
+#population counts for exceedances
+```{r}
+# Get total population of all assessed ATS blocks (filtered)
+SQL <- "
+SELECT
+  SUM(population) AS total_assessed_population
+FROM (
+  SELECT DISTINCT t.block, t.population
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_chlor` f
+    ON t.block = f.GEOID
+)
+"
+
+ats_all_blocks_chlor <- dbGetQuery(con, SQL)
+
+### Population counts for exceeding blocks (HI > 0.1)
+
+# Ensure GEOID in filtblocks_chlor is character with 15 digits
+filtblocks_chlor <- filtblocks %>%
+  mutate(GEOID = str_pad(as.character(GEOID), width = 15, side = "left", pad = "0"))
+
+# Filter chlor_exceedances to only blocks in filtblocks_chlor
+chlor_exceedances_filtered <- chlor_exceedances %>%
+  semi_join(filtblocks_chlor, by = c("block" = "GEOID"))
+
+# Summarize population for blocks with HI > 0.1 (unique blocks only)
+pop_summary_by_source_chlor <- chlor_exceedances_filtered %>%
+  pivot_longer(
+    cols = c(HI_tot, HI_pt, HI_other),
+    names_to = "HI_type",
+    values_to = "HI_value"
+  ) %>%
+  filter(HI_value > 0.1) %>%
+  distinct(HI_type, block, population) %>%   # <-- ensure each block counted once per HI type
+  group_by(HI_type) %>%
+  summarise(
+    total_pop = sum(population, na.rm = TRUE),
+    avg_pop   = mean(population, na.rm = TRUE),
+    n_blocks  = n_distinct(block),
+    .groups = "drop"
+  )
+
+write.csv(
+  pop_summary_by_source_chlor, 
+  "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/population_summary.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+
+

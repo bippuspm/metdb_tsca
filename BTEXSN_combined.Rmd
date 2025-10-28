@@ -1,0 +1,1445 @@
+---
+title: "Combining air and water HIs and analysis"
+author: "Paige Varner"
+date: "2025-06-25"
+output: html_document
+---
+
+
+#load libraries
+```{r}
+library("dplyr")
+library("tidyr")
+library("stringr")
+library("bigrquery")
+library("DBI")
+library("pheatmap")
+library("RColorBrewer")
+library("Rmisc")
+library("stats")
+library("rstatix")
+library("ggplot2")
+library("car")
+library("arrow")
+library("progressr")
+library("purrr")
+library("readr")
+library("haven")
+library(tidycensus)
+detach(package:Rmisc)
+detach(package:plyr)
+
+```
+
+
+#database connection
+```{r}
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "edf-aq-data",
+  dataset = "TSCA",)
+
+bq_auth(email = NA)
+```
+
+
+#important sensitivity analysis on combination statistics: 15,175 blocks are included in the PWS dataset but not the ATS dataset. need to check the population from the Census data on these blocks to see if they weren't included in ATS because ATS doesn't model exposures for blocks with population = 0. It makes sense otherwise that there are lots of blocks that have ATS data and not PWS data because millions are not on PWS.
+```{r}
+# Step 1: Query unmatched PWS blocks from BigQuery
+SQL <- "
+SELECT DISTINCT
+  LPAD(CAST(pws.geoid20 AS STRING), 15, '0') AS geoid20
+FROM `edf-aq-data.TSCA.BTEXS_PWS_HQs_half` AS pws
+WHERE LPAD(CAST(pws.geoid20 AS STRING), 15, '0') NOT IN (
+  SELECT DISTINCT LPAD(CAST(block AS STRING), 15, '0')
+  FROM `edf-aq-data.TSCA.BTEXSN_ATS_HIs`
+)
+"
+unmatched_PWS <- dbGetQuery(con, SQL)
+
+# Step 2: Get state FIPS codes from unmatched blocks
+unmatched_PWS <- unmatched_PWS %>%
+  mutate(state_fips = substr(geoid20, 1, 2))
+
+states_needed <- unique(unmatched_PWS$state_fips)
+
+# Step 4: Loop through those states to pull 2020 block-level population
+pop_blocks_all <- data.frame()
+
+for (fips in states_needed) {
+  message("Getting population for state FIPS: ", fips)
+  
+  tryCatch({
+    state_blocks <- get_decennial(
+      geography = "block",
+      variables = "P1_001N",  # total population 2020 PL data
+      year = 2020,
+      state = fips,
+      geometry = FALSE,
+      output = "wide",
+      dataset = "pl"
+    )
+    
+    pop_blocks_all <- bind_rows(pop_blocks_all, state_blocks)
+  }, error = function(e) {
+    message("Error for state ", fips, ": ", e$message)
+  })
+}
+
+
+# Step 5: Join population to unmatched PWS blocks
+pws_blocks_with_pop <- unmatched_PWS %>%
+  left_join(pop_blocks_all, by = c("geoid20" = "GEOID"))
+
+
+# Step 6: Summarize
+summary_table <- pws_blocks_with_pop %>%
+  mutate(pop = P1_001N) %>%
+  summarise(
+    total_blocks = n(),
+    blocks_with_population = sum(!is.na(pop) & pop > 0),
+    blocks_with_zero_or_na = sum(is.na(pop) | pop == 0),
+    total_population = sum(pop, na.rm = TRUE)
+  )
+
+# Step 7: View results
+print(summary_table)
+
+#all 15,175 blocks included in PWS and not in ATS have a population of zero or NA in the 2020 Census - this is great news, which means that the joining of the ATS and PWS HIs are joined properly and there are no issues with mismatching geoids, for example
+```
+
+
+
+#pull summary info on combined HIs - whether it is truly combined or if there's only ATS or PWS data (note: the N in these summaries is for block + endpoint combinations, except when broken by endpoint)
+```{r}
+# Overall summary table with sample size
+SQL <- "
+-- Summary for HI_tot_comb
+SELECT 
+  'HI_tot_comb' AS HI_type,
+  COUNT(HI_tot_comb) AS n,
+  MIN(HI_tot_comb) AS min,
+  MAX(HI_tot_comb) AS max,
+  AVG(HI_tot_comb) AS mean,
+  APPROX_QUANTILES(HI_tot_comb, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot_comb) AS std_dev,
+  STDDEV(HI_tot_comb) / SQRT(COUNT(HI_tot_comb)) AS std_error
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+
+UNION ALL
+
+-- Summary for HI_pt_comb
+SELECT
+  'HI_pt_comb' AS HI_type,
+  COUNT(HI_pt_comb),
+  MIN(HI_pt_comb),
+  MAX(HI_pt_comb),
+  AVG(HI_pt_comb),
+  APPROX_QUANTILES(HI_pt_comb, 2)[OFFSET(1)],
+  STDDEV(HI_pt_comb),
+  STDDEV(HI_pt_comb) / SQRT(COUNT(HI_pt_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+
+UNION ALL
+
+-- Summary for HI_other_comb
+SELECT
+  'HI_other_comb' AS HI_type,
+  COUNT(HI_other_comb),
+  MIN(HI_other_comb),
+  MAX(HI_other_comb),
+  AVG(HI_other_comb),
+  APPROX_QUANTILES(HI_other_comb, 2)[OFFSET(1)],
+  STDDEV(HI_other_comb),
+  STDDEV(HI_other_comb) / SQRT(COUNT(HI_other_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+"
+
+BTEXSN_HI_comb_summary <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_comb_summary,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI_combined_summary.csv",
+  row.names = FALSE
+)
+
+# Population summary with sample size
+SQL <- "
+-- Summary for HI_tot_comb by pop
+SELECT 
+  pop,
+  'HI_tot_comb' AS HI_type,
+  COUNT(HI_tot_comb) AS n,
+  MIN(HI_tot_comb) AS min,
+  MAX(HI_tot_comb) AS max,
+  AVG(HI_tot_comb) AS mean,
+  APPROX_QUANTILES(HI_tot_comb, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot_comb) AS std_dev,
+  STDDEV(HI_tot_comb) / SQRT(COUNT(HI_tot_comb)) AS std_error
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+GROUP BY pop
+
+UNION ALL
+
+-- Summary for HI_pt_comb by pop
+SELECT 
+  pop,
+  'HI_pt_comb' AS HI_type,
+  COUNT(HI_pt_comb),
+  MIN(HI_pt_comb),
+  MAX(HI_pt_comb),
+  AVG(HI_pt_comb),
+  APPROX_QUANTILES(HI_pt_comb, 2)[OFFSET(1)],
+  STDDEV(HI_pt_comb),
+  STDDEV(HI_pt_comb) / SQRT(COUNT(HI_pt_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+GROUP BY pop
+
+UNION ALL
+
+-- Summary for HI_other_comb by pop
+SELECT 
+  pop,
+  'HI_other_comb' AS HI_type,
+  COUNT(HI_other_comb),
+  MIN(HI_other_comb),
+  MAX(HI_other_comb),
+  AVG(HI_other_comb),
+  APPROX_QUANTILES(HI_other_comb, 2)[OFFSET(1)],
+  STDDEV(HI_other_comb),
+  STDDEV(HI_other_comb) / SQRT(COUNT(HI_other_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+GROUP BY pop
+"
+
+BTEXSN_HI_comb_summary_by_pop <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_comb_summary_by_pop,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI_combined_summary_by_pop.csv",
+  row.names = FALSE
+)
+
+# Population by endpoint summary with sample size
+SQL <- "
+-- Summary for HI_tot_comb by pop and endpoint
+SELECT 
+  pop,
+  endpoint,
+  'HI_tot_comb' AS HI_type,
+  COUNT(HI_tot_comb) AS n,
+  MIN(HI_tot_comb) AS min,
+  MAX(HI_tot_comb) AS max,
+  AVG(HI_tot_comb) AS mean,
+  APPROX_QUANTILES(HI_tot_comb, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot_comb) AS std_dev,
+  STDDEV(HI_tot_comb) / SQRT(COUNT(HI_tot_comb)) AS std_error
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+GROUP BY pop, endpoint
+
+UNION ALL
+
+-- Summary for HI_pt_comb by pop and endpoint
+SELECT 
+  pop,
+  endpoint,
+  'HI_pt_comb' AS HI_type,
+  COUNT(HI_pt_comb),
+  MIN(HI_pt_comb),
+  MAX(HI_pt_comb),
+  AVG(HI_pt_comb),
+  APPROX_QUANTILES(HI_pt_comb, 2)[OFFSET(1)],
+  STDDEV(HI_pt_comb),
+  STDDEV(HI_pt_comb) / SQRT(COUNT(HI_pt_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+GROUP BY pop, endpoint
+
+UNION ALL
+
+-- Summary for HI_other_comb by pop and endpoint
+SELECT 
+  pop,
+  endpoint,
+  'HI_other_comb' AS HI_type,
+  COUNT(HI_other_comb),
+  MIN(HI_other_comb),
+  MAX(HI_other_comb),
+  AVG(HI_other_comb),
+  APPROX_QUANTILES(HI_other_comb, 2)[OFFSET(1)],
+  STDDEV(HI_other_comb),
+  STDDEV(HI_other_comb) / SQRT(COUNT(HI_other_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+GROUP BY pop, endpoint
+"
+
+BTEXSN_HI_comb_summary_by_pop_endpoint <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_comb_summary_by_pop_endpoint,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI_combined_summary_by_pop_endpoint.csv",
+  row.names = FALSE
+)
+
+
+SQL <- "
+SELECT COUNT(DISTINCT t.geoid20) AS n_blocks_in_filtblocks
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE t.data_source = 'both'
+"
+
+dbGetQuery(con, SQL)
+
+
+```
+
+
+
+#pull summary info on combined HIs for blocks only where there are truly combined HIs (note: the N in these summaries is for block + endpoint combinations, except when broken by endpoint)
+```{r}
+# Overall summary table with sample size
+SQL <- "
+-- Summary for HI_tot_comb
+SELECT 
+  'HI_tot_comb' AS HI_type,
+  COUNT(HI_tot_comb) AS n,
+  MIN(HI_tot_comb) AS min,
+  MAX(HI_tot_comb) AS max,
+  AVG(HI_tot_comb) AS mean,
+  APPROX_QUANTILES(HI_tot_comb, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot_comb) AS std_dev,
+  STDDEV(HI_tot_comb) / SQRT(COUNT(HI_tot_comb)) AS std_error
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+
+UNION ALL
+
+-- Summary for HI_pt_comb
+SELECT
+  'HI_pt_comb',
+  COUNT(HI_pt_comb),
+  MIN(HI_pt_comb),
+  MAX(HI_pt_comb),
+  AVG(HI_pt_comb),
+  APPROX_QUANTILES(HI_pt_comb, 2)[OFFSET(1)],
+  STDDEV(HI_pt_comb),
+  STDDEV(HI_pt_comb) / SQRT(COUNT(HI_pt_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+
+UNION ALL
+
+-- Summary for HI_other_comb
+SELECT
+  'HI_other_comb',
+  COUNT(HI_other_comb),
+  MIN(HI_other_comb),
+  MAX(HI_other_comb),
+  AVG(HI_other_comb),
+  APPROX_QUANTILES(HI_other_comb, 2)[OFFSET(1)],
+  STDDEV(HI_other_comb),
+  STDDEV(HI_other_comb) / SQRT(COUNT(HI_other_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+"
+
+BTEXSN_HI_combonly_summary <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_combonly_summary,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI_combinedonly_summary.csv",
+  row.names = FALSE
+)
+
+# Summary by population with sample size
+SQL <- "
+-- Summary for HI_tot_comb by pop
+SELECT 
+  pop,
+  'HI_tot_comb' AS HI_type,
+  COUNT(HI_tot_comb) AS n,
+  MIN(HI_tot_comb) AS min,
+  MAX(HI_tot_comb) AS max,
+  AVG(HI_tot_comb) AS mean,
+  APPROX_QUANTILES(HI_tot_comb, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot_comb) AS std_dev,
+  STDDEV(HI_tot_comb) / SQRT(COUNT(HI_tot_comb)) AS std_error
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+GROUP BY pop
+
+UNION ALL
+
+-- Summary for HI_pt_comb by pop
+SELECT 
+  pop,
+  'HI_pt_comb',
+  COUNT(HI_pt_comb),
+  MIN(HI_pt_comb),
+  MAX(HI_pt_comb),
+  AVG(HI_pt_comb),
+  APPROX_QUANTILES(HI_pt_comb, 2)[OFFSET(1)],
+  STDDEV(HI_pt_comb),
+  STDDEV(HI_pt_comb) / SQRT(COUNT(HI_pt_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+GROUP BY pop
+
+UNION ALL
+
+-- Summary for HI_other_comb by pop
+SELECT 
+  pop,
+  'HI_other_comb',
+  COUNT(HI_other_comb),
+  MIN(HI_other_comb),
+  MAX(HI_other_comb),
+  AVG(HI_other_comb),
+  APPROX_QUANTILES(HI_other_comb, 2)[OFFSET(1)],
+  STDDEV(HI_other_comb),
+  STDDEV(HI_other_comb) / SQRT(COUNT(HI_other_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+GROUP BY pop
+"
+
+BTEXSN_HI_combonly_summary_by_pop <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_combonly_summary_by_pop,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI_combinedonly_summary_by_pop.csv",
+  row.names = FALSE
+)
+
+# Summary by population and endpoint with sample size
+SQL <- "
+-- Summary for HI_tot_comb by pop and endpoint
+SELECT 
+  pop,
+  endpoint,
+  'HI_tot_comb' AS HI_type,
+  COUNT(HI_tot_comb) AS n,
+  MIN(HI_tot_comb) AS min,
+  MAX(HI_tot_comb) AS max,
+  AVG(HI_tot_comb) AS mean,
+  APPROX_QUANTILES(HI_tot_comb, 2)[OFFSET(1)] AS median,
+  STDDEV(HI_tot_comb) AS std_dev,
+  STDDEV(HI_tot_comb) / SQRT(COUNT(HI_tot_comb)) AS std_error
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+GROUP BY pop, endpoint
+
+UNION ALL
+
+-- Summary for HI_pt_comb by pop and endpoint
+SELECT 
+  pop,
+  endpoint,
+  'HI_pt_comb',
+  COUNT(HI_pt_comb),
+  MIN(HI_pt_comb),
+  MAX(HI_pt_comb),
+  AVG(HI_pt_comb),
+  APPROX_QUANTILES(HI_pt_comb, 2)[OFFSET(1)],
+  STDDEV(HI_pt_comb),
+  STDDEV(HI_pt_comb) / SQRT(COUNT(HI_pt_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+GROUP BY pop, endpoint
+
+UNION ALL
+
+-- Summary for HI_other_comb by pop and endpoint
+SELECT 
+  pop,
+  endpoint,
+  'HI_other_comb',
+  COUNT(HI_other_comb),
+  MIN(HI_other_comb),
+  MAX(HI_other_comb),
+  AVG(HI_other_comb),
+  APPROX_QUANTILES(HI_other_comb, 2)[OFFSET(1)],
+  STDDEV(HI_other_comb),
+  STDDEV(HI_other_comb) / SQRT(COUNT(HI_other_comb))
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE data_source = 'both'
+GROUP BY pop, endpoint
+"
+
+BTEXSN_HI_combonly_summary_by_pop_endpoint <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_combonly_summary_by_pop_endpoint,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI_combinedonly_summary_by_pop_endpoint.csv",
+  row.names = FALSE
+)
+
+```
+
+
+#CDFs faceted by pop only for the total HI
+```{r}
+# --- 1. Pull the data ---
+project_id <- "edf-aq-data"
+
+SQL <- "
+SELECT
+  t.geoid20,
+  t.endpoint,
+  t.pop,
+  t.HI_tot_comb
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+"
+
+BTEXSN_combined_filtered <- bq_project_query(project_id, SQL) %>%
+  bq_table_download()
+
+# --- 2. Pre-compute CDF by population ---
+BTEXSN_cdf <- BTEXSN_combined_filtered %>%
+  group_by(pop) %>%
+  arrange(HI_tot_comb) %>%
+  mutate(cdf = row_number() / n()) %>%
+  ungroup()
+
+# Optional: thin points (every 10th to speed up plotting)
+BTEXSN_cdf_sample <- BTEXSN_cdf %>%
+  group_by(pop) %>%
+  slice(seq(1, n(), by = 10)) %>%
+  ungroup()
+
+# --- 3. Plot ---
+cdf_plot <- ggplot(BTEXSN_cdf_sample, aes(x = HI_tot_comb, y = cdf)) +
+  geom_line() +
+  # vertical reference lines for thresholds
+  geom_vline(xintercept = c(0.1, 1), linetype = "dotted", color = "black") +
+  scale_x_log10() +
+  labs(
+    title = "CDF of Combined HI_tot (BTEXSN, Children vs Adults)",
+    x = "HI_tot_comb (log scale)",
+    y = "P(HI ≤ x)"
+  ) +
+  facet_wrap(~pop, scales = "free_y") +
+  theme_minimal(base_size = 14)
+
+cdf_plot
+
+ggsave(
+  filename = "BTEXSN_combined_cdf.png",
+  device = "png",
+  plot = cdf_plot,
+  path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/",
+  width = 7,
+  height = 5
+)
+
+```
+
+
+
+
+#######################################
+
+### analysis with HI threshold of 1 
+
+#######################################
+
+
+
+#count of blocks with various HIs above 1 
+```{r}
+# Summarize counts of blocks exceeding HI > 1, filtered by filtblocks_BTEXSN
+SQL_counts <- "
+WITH counts AS (
+  SELECT
+    t.data_source,
+    t.pop,  -- adult or child
+
+    -- Unique block counts
+    COUNT(DISTINCT CASE WHEN t.HI_tot_comb   > 1 THEN t.geoid20 END) AS unique_blocks_above_1_tot,
+    COUNT(DISTINCT t.geoid20) AS total_unique_blocks_tot,
+
+    COUNT(DISTINCT CASE WHEN t.HI_pt_comb    > 1 THEN t.geoid20 END) AS unique_blocks_above_1_pt,
+    COUNT(DISTINCT t.geoid20) AS total_unique_blocks_pt,
+
+    COUNT(DISTINCT CASE WHEN t.HI_other_comb > 1 THEN t.geoid20 END) AS unique_blocks_above_1_other,
+    COUNT(DISTINCT t.geoid20) AS total_unique_blocks_other,
+
+    -- Row (block + endpoint combo) counts
+    COUNT(CASE WHEN t.HI_tot_comb   > 1 THEN 1 END) AS total_exceedances_tot,
+    COUNT(t.HI_tot_comb)   AS total_combos_tot,
+
+    COUNT(CASE WHEN t.HI_pt_comb    > 1 THEN 1 END) AS total_exceedances_pt,
+    COUNT(t.HI_pt_comb)    AS total_combos_pt,
+
+    COUNT(CASE WHEN t.HI_other_comb > 1 THEN 1 END) AS total_exceedances_other,
+    COUNT(t.HI_other_comb) AS total_combos_other
+
+  FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = f.GEOID
+  GROUP BY t.data_source, t.pop
+)
+
+-- Reshape into long format
+SELECT data_source, pop, 'HI_tot_comb' AS HI_type,
+  unique_blocks_above_1_tot AS unique_blocks_above_1,
+  total_unique_blocks_tot   AS total_unique_blocks,
+  total_exceedances_tot     AS total_exceedances,
+  total_combos_tot          AS total_block_endpoint_combos
+FROM counts
+
+UNION ALL
+
+SELECT data_source, pop, 'HI_pt_comb',
+  unique_blocks_above_1_pt,
+  total_unique_blocks_pt,
+  total_exceedances_pt,
+  total_combos_pt
+FROM counts
+
+UNION ALL
+
+SELECT data_source, pop, 'HI_other_comb',
+  unique_blocks_above_1_other,
+  total_unique_blocks_other,
+  total_exceedances_other,
+  total_combos_other
+FROM counts
+
+ORDER BY data_source, pop, HI_type;
+"
+
+BTEXSN_blocks_HIsabove1_by_sourcepop <- dbGetQuery(con, SQL_counts)
+
+write.csv(
+  BTEXSN_blocks_HIsabove1_by_sourcepop,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/blocks_HIsabove1_combined_by_sourcepop.csv",
+  row.names = FALSE
+)
+
+
+# Pull df of HIs > 1 for further analysis, filtered by filtblocks_BTEXSN
+SQL_exceedances <- "
+SELECT t.*
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE t.HI_tot_comb > 1 OR t.HI_pt_comb > 1 OR t.HI_other_comb > 1;
+"
+
+BTEXSN_exceedances <- dbGetQuery(con, SQL_exceedances)
+
+```
+
+
+
+# how many blocks exceed more than one health endpoint threshold (grouped by block, data source, and population): only air data sources exceeded mulitple
+```{r}
+# Identify blocks with multiple endpoints exceeding thresholds, grouped by data_source and pop
+blocks_mult_endpoints <- BTEXSN_exceedances %>%
+  group_by(geoid20, data_source, pop) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(unique(endpoint), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_endpoints_exceeding > 1)
+
+# Filter the original exceedances for those blocks and join back summary info
+BTEXSN_mult_endpoints <- BTEXSN_exceedances %>%
+  semi_join(blocks_mult_endpoints, by = c("geoid20", "data_source", "pop")) %>%
+  left_join(blocks_mult_endpoints, by = c("geoid20", "data_source", "pop"))
+
+# Write CSV
+write.csv(blocks_mult_endpoints, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/blocks_mult_endpoints_by_source_pop.csv", 
+          row.names = FALSE)
+
+```
+
+
+
+#number of blocks with combined HIs that exceeds threshold that didn't exceed from just air or water (note: these numbers are for block + endpoint combinations)
+```{r}
+# Function to compute exceedance summary per pop group and HI type
+get_hi_exceedance_summary <- function(df, hi_type, ats_col, pws_col, comb_col) {
+  df %>%
+    filter(.data[[comb_col]] > 1) %>%
+    mutate(
+      ats_below_1 = is.na(.data[[ats_col]]) | .data[[ats_col]] < 1,
+      pws_below_1 = is.na(.data[[pws_col]]) | .data[[pws_col]] < 1,
+      both_below_1 = ats_below_1 & pws_below_1,
+      either_below_1 = ats_below_1 | pws_below_1,
+      below_which = case_when(
+        both_below_1 ~ "ats, pws",
+        ats_below_1 ~ "ats",
+        pws_below_1 ~ "pws",
+        TRUE ~ "neither"
+      ),
+      exceeded_which = paste0(
+        ifelse(!is.na(.data[[ats_col]]) & .data[[ats_col]] > 1, ats_col, ""),
+        ifelse(!is.na(.data[[ats_col]]) & .data[[ats_col]] > 1 & !is.na(.data[[pws_col]]) & .data[[pws_col]] > 1, ", ", ""),
+        ifelse(!is.na(.data[[pws_col]]) & .data[[pws_col]] > 1, "pws_HI", "")
+      ),
+      HI_type = hi_type
+    ) %>%
+    select(geoid20, pop, HI_type, !!comb_col, !!ats_col, !!pws_col,
+           ats_below_1, pws_below_1, both_below_1, either_below_1,
+           below_which, exceeded_which)
+}
+
+# Run for each HI type, return all results
+df_tot <- get_hi_exceedance_summary(BTEXSN_exceedances, "HI_tot_comb", "ats_HI_tot", "pws_HI", "HI_tot_comb")
+df_pt <- get_hi_exceedance_summary(BTEXSN_exceedances, "HI_pt_comb", "ats_HI_pt", "pws_HI", "HI_pt_comb")
+df_other <- get_hi_exceedance_summary(BTEXSN_exceedances, "HI_other_comb", "ats_HI_other", "pws_HI", "HI_other_comb")
+
+# Combine into full dataset
+all_HI_exceedances <- bind_rows(df_tot, df_pt, df_other)
+
+# summary with individual ATS and PWS below-1 counts
+summary_table <- all_HI_exceedances %>%
+  group_by(HI_type, pop) %>%
+  summarise(
+    total_comb_HI_over_1 = n(),
+    count_both_below_1 = sum(both_below_1),
+    count_ats_below_1_only = sum(ats_below_1 & !pws_below_1),
+    count_pws_below_1_only = sum(pws_below_1 & !ats_below_1),
+    .groups = "drop"
+  )
+
+# Save outputs
+write.csv(summary_table, "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/blocks_combined_HI_summary_by_pop.csv", row.names = FALSE)
+
+```
+
+
+
+#graph on fractional contributions of air vs. water for exceedances (note: these numbers are for block + endpoint combinations)
+```{r}
+# Filter to blocks with both ATS and PWS data and get their averages + SD
+
+combined_contrib <- BTEXSN_exceedances %>%
+  filter(data_source == "both") %>%
+  select(pop, ats_HI_tot, ats_HI_pt,
+         pws_HI, HI_tot_comb, HI_pt_comb) %>%   # removed ats_HI_other, HI_other_comb
+  pivot_longer(
+    cols = c(ats_HI_tot, ats_HI_pt),
+    names_to = "HI_type",
+    names_prefix = "ats_HI_",
+    values_to = "ats_HI"
+  ) %>%
+  mutate(
+    HI_comb = case_when(
+      HI_type == "tot" ~ HI_tot_comb,
+      HI_type == "pt" ~ HI_pt_comb
+    ),
+    ats_fraction = ats_HI / HI_comb,
+    pws_fraction = pws_HI / HI_comb
+  ) %>%
+  filter(HI_comb > 0) %>%
+  group_by(pop, HI_type) %>%
+  summarise(
+    mean_ats = mean(ats_fraction, na.rm = TRUE),
+    sd_ats = sd(ats_fraction, na.rm = TRUE),
+    mean_pws = mean(pws_fraction, na.rm = TRUE),
+    sd_pws = sd(pws_fraction, na.rm = TRUE),
+    n_blocks = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(mean_ats, mean_pws, sd_ats, sd_pws),
+               names_to = c("stat", "source"),
+               names_sep = "_",
+               values_to = "value") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(
+    source = ifelse(source == "ats", "ATS", "PWS"),
+    HI_type = dplyr::recode(as.character(HI_type),
+                            "tot" = "HI_tot_comb",
+                            "pt"  = "HI_pt_comb")
+  )
+
+write.csv(combined_contrib, 
+          "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/ats_pws_frac_contributions.csv", 
+          row.names = FALSE)
+
+# stacked bar chart (only tot + pt)
+ats_pws_contributions = ggplot(combined_contrib, aes(x = HI_type, y = mean, fill = source)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.9),
+    width = 0.2,
+    color = "black"
+  ) +
+  facet_wrap(~pop, labeller = labeller(pop = c("ad" = "Adults", "ch" = "Children"))) +
+  scale_fill_manual(values = c("ATS" = "#1f77b4", "PWS" = "#ff7f0e")) +
+  labs(
+    title = "Average Contribution to HI for Blocks with HI > 1 & Both Sources",
+    x = "Combined HI Type",
+    y = "Mean Fractional Contribution",
+    fill = "Data Source"
+  ) +
+  scale_x_discrete(labels = c(
+    "HI_pt_comb"  = "Point Only",
+    "HI_tot_comb" = "Total"
+  )) +
+  theme_minimal(base_size = 14)
+
+ats_pws_contributions
+
+ggsave(
+  filename = "bar_ats_pws_contributions.png",
+  device = "png",
+  plot = ats_pws_contributions,
+  path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/",
+  width = 7,
+  height = 5
+)
+
+
+```
+
+
+
+
+#graph on just raw mean and/or median of air vs. water HIs for exceedances where both contirubted to the HI (note: these numbers are for block + endpoint combinations)
+```{r}
+# Prepare long-format data for ATS and PWS HI values by type (exclude "other")
+combined_raw_HIs <- BTEXSN_exceedances %>%
+  filter(data_source == "both") %>%
+  select(pop, 
+         ats_HI_tot, ats_HI_pt,
+         pws_HI) %>%   # removed ats_HI_other
+  pivot_longer(
+    cols = c(ats_HI_tot, ats_HI_pt),   # only tot and pt
+    names_to = "HI_type",
+    names_prefix = "ats_HI_",
+    values_to = "ats_HI"
+  ) %>%
+  mutate(
+    HI_type_full = dplyr::recode(HI_type,
+                                 "tot" = "HI_tot_comb",
+                                 "pt"  = "HI_pt_comb")
+  ) %>%
+  group_by(pop, HI_type_full) %>%
+  summarise(
+    mean_ats = mean(ats_HI, na.rm = TRUE),
+    median_ats = median(ats_HI, na.rm = TRUE),
+    sd_ats = sd(ats_HI, na.rm = TRUE),
+    
+    mean_pws = mean(pws_HI, na.rm = TRUE),
+    median_pws = median(pws_HI, na.rm = TRUE),
+    sd_pws = sd(pws_HI, na.rm = TRUE),
+    
+    n_blocks = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(mean_ats, median_ats, sd_ats, mean_pws, median_pws, sd_pws),
+    names_to = c("stat", "source"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(
+    source = ifelse(source == "ats", "ATS", "PWS"),
+    HI_type = HI_type_full
+  ) %>%
+  select(-HI_type_full)
+
+write.csv(combined_raw_HIs, "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/ats_pws_raw_HIs.csv", row.names = FALSE)
+
+# Plot only tot and pt
+ats_pws_raw = ggplot(combined_raw_HIs, aes(x = HI_type, y = mean, fill = source)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.9),
+    width = 0.2,
+    color = "black"
+  ) +
+  facet_wrap(~pop, labeller = labeller(pop = c("ad" = "Adults", "ch" = "Children"))) +
+  scale_fill_manual(values = c("ATS" = "#1f77b4", "PWS" = "#ff7f0e")) +
+  labs(
+    title = "Average HI for Blocks with HI > 1 & Both Sources",
+    x = "HI Type",
+    y = "Avg HI",
+    fill = "Data Source"
+  ) +
+  scale_x_discrete(labels = c(
+    "HI_pt_comb"  = "Point Only",
+    "HI_tot_comb" = "Total"
+  )) +
+  theme_minimal(base_size = 14)
+
+ats_pws_raw
+
+ggsave(filename = "bar_ats_pws_avgHI.png", device = "png", plot = ats_pws_raw, 
+       path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/", width = 7, height = 5)
+
+```
+
+
+#population counts for exceedances
+```{r}
+pop_summary_by_source_unique <- BTEXSN_exceedances %>%
+  pivot_longer(
+    cols = c(HI_tot_comb, HI_pt_comb, HI_other_comb),
+    names_to = "HI_type",
+    values_to = "HI_value"
+  ) %>%
+  filter(HI_value > 1) %>%
+  # keep only unique blocks per population, HI type, and data_source
+  distinct(geoid20, pop, HI_type, data_source, population, .keep_all = TRUE) %>%
+  group_by(pop, HI_type, data_source) %>%
+  summarise(
+    total_pop = sum(population, na.rm = TRUE),
+    avg_pop   = mean(population, na.rm = TRUE),
+    n_blocks  = n_distinct(geoid20),
+    .groups   = "drop"
+  )
+
+write.csv(
+  pop_summary_by_source_unique,
+  "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI1/population_summary_unique_blocks.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+#pull in df of blocks that have both PWS and ATS sources and match the TRI filter, and also have any HI above 1
+```{r}
+project_id <- "edf-aq-data"
+
+
+SQL <- "
+WITH blocks_with_hi_above1 AS (
+  SELECT DISTINCT geoid20
+  FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = f.GEOID
+  WHERE t.block_has_both_sources = TRUE
+    AND (t.HI_tot_comb > 1 OR t.HI_pt_comb > 1 OR t.HI_other_comb > 1)
+)
+
+SELECT t.*
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `blocks_with_hi_above1` b
+  ON t.geoid20 = b.geoid20
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+"
+
+BTEXSN_HI_any_above1 <- bq_project_query(project_id, SQL) %>%
+  bq_table_download()
+
+```
+
+
+
+#which blocks had more than 1 endpoint exceeding an HI of 1, and what were the sources? were there any that had HI exceedances from more than one source (both ATS and PWS?) --> answer: blocks that had multiple exceedances had both sources contributing to that endpoint's HI exceedances; for example, there were no blocks that exceeded for hematological from ATS and exceeded endocrine from PWS
+```{r}
+block_hi_long <- BTEXSN_HI_any_above1 %>%
+  pivot_longer(
+    cols = c(HI_tot_comb, HI_pt_comb, HI_other_comb),
+    names_to = "hi_type",
+    values_to = "hi_value"
+  ) %>%
+  filter(hi_value > 1) %>%
+  select(geoid20, endpoint, data_source, pop, hi_type, hi_value) %>%
+  arrange(geoid20, endpoint, pop, hi_type)
+
+```
+
+
+
+
+
+#######################################
+
+### analysis with HI threshold of 0.1 
+
+#######################################
+
+
+
+
+#count of block + endpoint combos with various HIs above 0.1 
+```{r}
+SQL_counts <- "
+WITH counts AS (
+  SELECT
+    t.data_source,
+    t.pop,  -- adult or child
+
+    -- Unique block counts
+    COUNT(DISTINCT CASE WHEN t.HI_tot_comb   > 0.1 THEN t.geoid20 END) AS unique_blocks_above_01_tot,
+    COUNT(DISTINCT t.geoid20) AS total_unique_blocks_tot,
+
+    COUNT(DISTINCT CASE WHEN t.HI_pt_comb    > 0.1 THEN t.geoid20 END) AS unique_blocks_above_01_pt,
+    COUNT(DISTINCT t.geoid20) AS total_unique_blocks_pt,
+
+    COUNT(DISTINCT CASE WHEN t.HI_other_comb > 0.1 THEN t.geoid20 END) AS unique_blocks_above_01_other,
+    COUNT(DISTINCT t.geoid20) AS total_unique_blocks_other,
+
+    -- Row (block + endpoint combo) counts
+    COUNT(CASE WHEN t.HI_tot_comb   > 0.1 THEN 1 END) AS total_exceedances_tot,
+    COUNT(t.HI_tot_comb)   AS total_combos_tot,
+
+    COUNT(CASE WHEN t.HI_pt_comb    > 0.1 THEN 1 END) AS total_exceedances_pt,
+    COUNT(t.HI_pt_comb)    AS total_combos_pt,
+
+    COUNT(CASE WHEN t.HI_other_comb > 0.1 THEN 1 END) AS total_exceedances_other,
+    COUNT(t.HI_other_comb) AS total_combos_other
+
+  FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = f.GEOID
+  GROUP BY t.data_source, t.pop
+)
+
+-- Reshape into long format
+SELECT data_source, pop, 'HI_tot_comb' AS HI_type,
+  unique_blocks_above_01_tot AS unique_blocks_above_01,
+  total_unique_blocks_tot    AS total_unique_blocks,
+  total_exceedances_tot      AS total_exceedances,
+  total_combos_tot           AS total_block_endpoint_combos
+FROM counts
+
+UNION ALL
+
+SELECT data_source, pop, 'HI_pt_comb',
+  unique_blocks_above_01_pt,
+  total_unique_blocks_pt,
+  total_exceedances_pt,
+  total_combos_pt
+FROM counts
+
+UNION ALL
+
+SELECT data_source, pop, 'HI_other_comb',
+  unique_blocks_above_01_other,
+  total_unique_blocks_other,
+  total_exceedances_other,
+  total_combos_other
+FROM counts
+
+ORDER BY data_source, pop, HI_type;
+"
+
+BTEXSN_blocks_HIsabove01_by_sourcepop <- dbGetQuery(con, SQL_counts)
+
+write.csv(
+  BTEXSN_blocks_HIsabove01_by_sourcepop,
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/blocks_HIsabove01_combined_by_sourcepop.csv",
+  row.names = FALSE
+)
+
+
+
+# Pull df of HIs > 0.1 for further analysis, filtered by filtblocks_BTEXSN
+SQL_exceedances <- "
+SELECT t.*
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+WHERE t.HI_tot_comb > 0.1 OR t.HI_pt_comb > 0.1 OR t.HI_other_comb > 0.1;
+"
+
+BTEXSN_exceedances <- dbGetQuery(con, SQL_exceedances)
+
+```
+
+
+
+# how many blocks exceed more than one health endpoint threshold (grouped by block, data source, and population)
+```{r}
+# Identify blocks with multiple endpoints exceeding thresholds, grouped by data_source and pop
+blocks_mult_endpoints <- BTEXSN_exceedances %>%
+  group_by(geoid20, data_source, pop) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(unique(endpoint), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_endpoints_exceeding > 1)
+
+# Filter the original exceedances for those blocks and join back summary info
+BTEXSN_mult_endpoints <- BTEXSN_exceedances %>%
+  semi_join(blocks_mult_endpoints, by = c("geoid20", "data_source", "pop")) %>%
+  left_join(blocks_mult_endpoints, by = c("geoid20", "data_source", "pop"))
+
+# Write CSV
+write.csv(blocks_mult_endpoints, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/blocks_mult_endpoints_by_source_pop.csv", 
+          row.names = FALSE)
+```
+
+
+
+#number of blocks with combined HIs that exceeds threshold that didn't exceed from just air or water (note, this is counting block + endpoint combos)
+```{r}
+# Function to compute exceedance summary per pop group and HI type
+get_hi_exceedance_summary <- function(df, hi_type, ats_col, pws_col, comb_col) {
+  df %>%
+    filter(.data[[comb_col]] > 0.1) %>%
+    mutate(
+      ats_below_01 = is.na(.data[[ats_col]]) | .data[[ats_col]] < 0.1,
+      pws_below_01 = is.na(.data[[pws_col]]) | .data[[pws_col]] < 0.1,
+      both_below_01 = ats_below_01 & pws_below_01,
+      either_below_01 = ats_below_01 | pws_below_01,
+      below_which = case_when(
+        both_below_01 ~ "ats, pws",
+        ats_below_01 ~ "ats",
+        pws_below_01 ~ "pws",
+        TRUE ~ "neither"
+      ),
+      exceeded_which = paste0(
+        ifelse(!is.na(.data[[ats_col]]) & .data[[ats_col]] > 0.1, ats_col, ""),
+        ifelse(!is.na(.data[[ats_col]]) & .data[[ats_col]] > 0.1 & !is.na(.data[[pws_col]]) & .data[[pws_col]] > 0.1, ", ", ""),
+        ifelse(!is.na(.data[[pws_col]]) & .data[[pws_col]] > 0.1, "pws_HI", "")
+      ),
+      HI_type = hi_type
+    ) %>%
+    select(geoid20, pop, HI_type, !!comb_col, !!ats_col, !!pws_col,
+           ats_below_01, pws_below_01, both_below_01, either_below_01,
+           below_which, exceeded_which)
+}
+
+# Run for each HI type, return all results
+df_tot <- get_hi_exceedance_summary(BTEXSN_exceedances, "HI_tot_comb", "ats_HI_tot", "pws_HI", "HI_tot_comb")
+df_pt <- get_hi_exceedance_summary(BTEXSN_exceedances, "HI_pt_comb", "ats_HI_pt", "pws_HI", "HI_pt_comb")
+df_other <- get_hi_exceedance_summary(BTEXSN_exceedances, "HI_other_comb", "ats_HI_other", "pws_HI", "HI_other_comb")
+
+# Combine into full dataset
+all_HI_exceedances <- bind_rows(df_tot, df_pt, df_other)
+
+# summary with individual ATS and PWS below 0.1 
+summary_table <- all_HI_exceedances %>%
+  group_by(HI_type, pop) %>%
+  summarise(
+    total_comb_HI_over_01 = n(),
+    count_both_below_01 = sum(both_below_01),
+    count_ats_below_01_only = sum(ats_below_01 & !pws_below_01),
+    count_pws_below_01_only = sum(pws_below_01 & !ats_below_01),
+    .groups = "drop"
+  )
+
+# Save outputs
+write.csv(summary_table, "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/blocks_combined_HI_summary_by_pop.csv", row.names = FALSE)
+
+```
+
+
+
+#graph on fractional contributions of air vs. water for exceedances (note: these numbers are for block + endpoint combinations)
+```{r}
+# Filter to blocks with both ATS and PWS data and get their averages + SD
+
+combined_contrib <- BTEXSN_exceedances %>%
+  filter(data_source == "both") %>%
+  select(pop, ats_HI_tot, ats_HI_pt,
+         pws_HI, HI_tot_comb, HI_pt_comb) %>%   # removed ats_HI_other, HI_other_comb
+  pivot_longer(
+    cols = c(ats_HI_tot, ats_HI_pt),
+    names_to = "HI_type",
+    names_prefix = "ats_HI_",
+    values_to = "ats_HI"
+  ) %>%
+  mutate(
+    HI_comb = case_when(
+      HI_type == "tot" ~ HI_tot_comb,
+      HI_type == "pt" ~ HI_pt_comb
+    ),
+    ats_fraction = ats_HI / HI_comb,
+    pws_fraction = pws_HI / HI_comb
+  ) %>%
+  filter(HI_comb > 0) %>%
+  group_by(pop, HI_type) %>%
+  summarise(
+    mean_ats = mean(ats_fraction, na.rm = TRUE),
+    sd_ats = sd(ats_fraction, na.rm = TRUE),
+    mean_pws = mean(pws_fraction, na.rm = TRUE),
+    sd_pws = sd(pws_fraction, na.rm = TRUE),
+    n_blocks = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(mean_ats, mean_pws, sd_ats, sd_pws),
+               names_to = c("stat", "source"),
+               names_sep = "_",
+               values_to = "value") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(
+    source = ifelse(source == "ats", "ATS", "PWS"),
+    HI_type = dplyr::recode(as.character(HI_type),
+                            "tot" = "HI_tot_comb",
+                            "pt"  = "HI_pt_comb")
+  )
+
+write.csv(combined_contrib, 
+          "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/ats_pws_frac_contributions.csv", 
+          row.names = FALSE)
+
+# stacked bar chart (only tot + pt)
+ats_pws_contributions = ggplot(combined_contrib, aes(x = HI_type, y = mean, fill = source)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.9),
+    width = 0.2,
+    color = "black"
+  ) +
+  facet_wrap(~pop, labeller = labeller(pop = c("ad" = "Adults", "ch" = "Children"))) +
+  scale_fill_manual(values = c("ATS" = "#1f77b4", "PWS" = "#ff7f0e")) +
+  labs(
+    title = "Average Contribution to HI for Blocks with HI > 0.1 & Both Sources",
+    x = "Combined HI Type",
+    y = "Mean Fractional Contribution",
+    fill = "Data Source"
+  ) +
+  scale_x_discrete(labels = c(
+    "HI_pt_comb"  = "Point Only",
+    "HI_tot_comb" = "Total"
+  )) +
+  theme_minimal(base_size = 14)
+
+ats_pws_contributions
+
+ggsave(
+  filename = "bar_ats_pws_contributions.png",
+  device = "png",
+  plot = ats_pws_contributions,
+  path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/",
+  width = 7,
+  height = 5
+)
+
+
+```
+
+
+
+
+#graph on just raw mean and/or median of air vs. water HIs for exceedances where both contirubted to the HI (note: these numbers are for block + endpoint combinations)
+```{r}
+# Prepare long-format data for ATS and PWS HI values by type (exclude "other")
+combined_raw_HIs <- BTEXSN_exceedances %>%
+  filter(data_source == "both") %>%
+  select(pop, 
+         ats_HI_tot, ats_HI_pt,
+         pws_HI) %>%   # removed ats_HI_other
+  pivot_longer(
+    cols = c(ats_HI_tot, ats_HI_pt),   # only tot and pt
+    names_to = "HI_type",
+    names_prefix = "ats_HI_",
+    values_to = "ats_HI"
+  ) %>%
+  mutate(
+    HI_type_full = dplyr::recode(HI_type,
+                                 "tot" = "HI_tot_comb",
+                                 "pt"  = "HI_pt_comb")
+  ) %>%
+  group_by(pop, HI_type_full) %>%
+  summarise(
+    mean_ats = mean(ats_HI, na.rm = TRUE),
+    median_ats = median(ats_HI, na.rm = TRUE),
+    sd_ats = sd(ats_HI, na.rm = TRUE),
+    
+    mean_pws = mean(pws_HI, na.rm = TRUE),
+    median_pws = median(pws_HI, na.rm = TRUE),
+    sd_pws = sd(pws_HI, na.rm = TRUE),
+    
+    n_blocks = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(mean_ats, median_ats, sd_ats, mean_pws, median_pws, sd_pws),
+    names_to = c("stat", "source"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(
+    source = ifelse(source == "ats", "ATS", "PWS"),
+    HI_type = HI_type_full
+  ) %>%
+  select(-HI_type_full)
+
+write.csv(combined_raw_HIs, "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/ats_pws_raw_HIs.csv", row.names = FALSE)
+
+# Plot only tot and pt
+ats_pws_raw = ggplot(combined_raw_HIs, aes(x = HI_type, y = mean, fill = source)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.9),
+    width = 0.2,
+    color = "black"
+  ) +
+  facet_wrap(~pop, labeller = labeller(pop = c("ad" = "Adults", "ch" = "Children"))) +
+  scale_fill_manual(values = c("ATS" = "#1f77b4", "PWS" = "#ff7f0e")) +
+  labs(
+    title = "Average HI for Blocks with HI > 0.1 & Both Sources",
+    x = "HI Type",
+    y = "Avg HI",
+    fill = "Data Source"
+  ) +
+  scale_x_discrete(labels = c(
+    "HI_pt_comb"  = "Point Only",
+    "HI_tot_comb" = "Total"
+  )) +
+  theme_minimal(base_size = 14)
+
+ats_pws_raw
+
+ggsave(filename = "bar_ats_pws_avgHI.png", device = "png", plot = ats_pws_raw, 
+       path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/", width = 7, height = 5)
+
+```
+
+
+#population counts for exceedances (these are giving me unique block and population counts)
+```{r}
+pop_summary_by_source_unique <- BTEXSN_exceedances %>%
+  pivot_longer(
+    cols = c(HI_tot_comb, HI_pt_comb, HI_other_comb),
+    names_to = "HI_type",
+    values_to = "HI_value"
+  ) %>%
+  filter(HI_value > 0.1) %>%
+  # keep only unique blocks per population, HI type, and data_source
+  distinct(geoid20, pop, HI_type, data_source, population, .keep_all = TRUE) %>%
+  group_by(pop, HI_type, data_source) %>%
+  summarise(
+    total_pop = sum(population, na.rm = TRUE),
+    avg_pop   = mean(population, na.rm = TRUE),
+    n_blocks  = n_distinct(geoid20),
+    .groups   = "drop"
+  )
+
+write.csv(
+  pop_summary_by_source_unique,
+  "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/HI01/population_summary_unique_blocks.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+#pull in df of blocks that have both PWS and ATS sources and match the TRI filter, and also have any HI above 0.1
+```{r}
+project_id <- "edf-aq-data"
+
+
+SQL <- "
+WITH blocks_with_hi_above01 AS (
+  SELECT DISTINCT geoid20
+  FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = f.GEOID
+  WHERE t.block_has_both_sources = TRUE
+    AND (t.HI_tot_comb > 0.1 OR t.HI_pt_comb > 0.1 OR t.HI_other_comb > 0.1)
+)
+
+SELECT t.*
+FROM `edf-aq-data.TSCA.BTEXSN_combined_HIs` t
+JOIN `blocks_with_hi_above01` b
+  ON t.geoid20 = b.geoid20
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+"
+
+BTEXSN_HI_any_above01 <- bq_project_query(project_id, SQL) %>%
+  bq_table_download()
+
+```
+
+
+
+#which blocks had more than 1 endpoint exceeding an HI of 1, and what were the sources? were there any that had HI exceedances from more than one source (both ATS and PWS?); answer: no block had 1 endpoint exceeded for ATS and another for PWS, for example. The anlysis done on blocks that had "both" data sources is above and more interesting
+```{r}
+block_hi_long_sep <- BTEXSN_HI_any_above01 %>%
+  # keep only total and point
+  pivot_longer(
+    cols = c(HI_tot_comb, HI_pt_comb),
+    names_to = "hi_type",
+    values_to = "hi_value"
+  ) %>%
+  # keep only exceedances
+  filter(hi_value > 0.1) %>%
+  # each row is block + pop + endpoint + data_source + HI type
+  select(geoid20, endpoint, pop, data_source, hi_type, hi_value) %>%
+  arrange(geoid20, pop, endpoint, hi_type)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

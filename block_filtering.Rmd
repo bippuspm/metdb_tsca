@@ -1,0 +1,334 @@
+---
+title: "Filtering for blocks with TSCA facilities"
+author: "Paige Varner"
+date: "2025-09-04"
+output: html_document
+---
+
+
+#load libraries
+```{r}
+library("dplyr")
+library("tidyr")
+library("bigrquery")
+library("DBI")
+library("tidycensus")
+library("sf")
+library("purrr")
+library("tigris")
+library("progress")
+options(tigris_use_cache = TRUE)
+
+naics = read.csv("~/TSCA/CRA/metdb_tsca/data/naics_tri_filter.csv")
+```
+
+
+#database connection
+```{r}
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "edf-aq-data",
+  dataset = "airtoxscreen",)
+
+bq_auth(email = NA)
+```
+
+
+### BTEXSN blocks ###
+
+#pull df of TRI facility IDs, their lat/longs, and NAICS code for facilities releasing BTEXSN, then filter for NAICS codes of interest
+```{r}
+#pull df from BQ
+SQL <- "
+SELECT DISTINCT
+  trifd,
+  latitude,
+  longitude,
+  primary_NAICS,
+  NAICS2,
+  NAICS3,
+  NAICS4,
+  NAICS5,
+  NAICS6
+FROM `edf-aq-data.tri.tri_basic_2017-2022`
+WHERE chemical IN (
+  'Benzene',
+  'Toluene',
+  'Ethylbenzene',
+  'm-Xylene',
+  'p-Xylene',
+  'o-Xylene',
+  'Xylene (mixed isomers)',
+  'Styrene',
+  'Naphthalene'
+)
+"
+
+TRI_BTEXSN = dbGetQuery(con, SQL)
+
+#filter for NAICS codes
+naics_codes <- naics$Code %>% as.character()
+
+TRI_BTEXSN <- TRI_BTEXSN %>%
+  filter(
+    primary_NAICS %in% naics_codes |
+    NAICS2 %in% naics_codes |
+    NAICS3 %in% naics_codes |
+    NAICS4 %in% naics_codes |
+    NAICS5 %in% naics_codes |
+    NAICS6 %in% naics_codes
+  )
+
+```
+
+
+#get list of blocks overlapping within 10km of any of these facilities
+```{r}
+# 1. TRI facilities into sf
+tri_sf <- TRI_BTEXSN %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# 2. Project to CRS in meters (good for buffering)
+tri_sf_proj <- st_transform(tri_sf, 5070)
+
+# 3. 10 km buffer, union into one geometry (for block-only overlap check)
+tri_buffer_union <- st_buffer(tri_sf_proj, dist = 10000) %>%
+  st_union()
+
+# 4. Valid states: 50 states + DC only
+valid_states <- c(state.abb, "DC")
+
+# 5. Setup progress bar
+pb <- progress_bar$new(
+  format = "Processing :state [:bar] :percent | Found :n blocks",
+  total = length(valid_states), clear = FALSE, width = 80
+)
+
+# Directory to store intermediate results
+dir.create("~/TSCA/CRA/metdb_tsca/data/filtblocks_states", showWarnings = FALSE)
+
+# 6. Loop state-by-state with intermediate save (blocks only)
+map_dfr(valid_states, function(st) {
+  # Skip if already processed
+  outfile <- file.path("~/TSCA/CRA/metdb_tsca/data/filtblocks_states", paste0("blocks_", st, ".csv"))
+  if (file.exists(outfile)) {
+    pb$tick(tokens = list(state = st, n = "skipped"))
+    return(read.csv(outfile, colClasses = "character"))
+  }
+  
+  # Load blocks for one state
+  blk <- blocks(state = st, year = 2020) %>%
+    st_transform(5070)
+  
+  # Find overlaps with union of all buffers
+  blk_overlap <- blk %>%
+    filter(st_intersects(., tri_buffer_union, sparse = FALSE))
+  
+  n_found <- nrow(blk_overlap)
+  
+  # Update progress bar
+  pb$tick(tokens = list(state = st, n = n_found))
+  
+  # Prepare output
+  df_out <- blk_overlap %>%
+    st_drop_geometry() %>%
+    select(GEOID20) %>%
+    distinct() %>%
+    rename(GEOID = GEOID20)
+  
+  # Save intermediate
+  write.csv(df_out, outfile, row.names = FALSE)
+  
+  df_out
+}) -> blocks_overlap
+
+# 7. Combine all states + deduplicate
+filtblocks_BTEXSN <- blocks_overlap %>% distinct()
+
+# 8. Save final combined file (block-only)
+write.csv(filtblocks_BTEXSN, 
+          file = "~/TSCA/CRA/metdb_tsca/data/filtblocks_BTEXSN.csv", 
+          row.names = FALSE)
+
+# 9. Optional sanity check
+cat("Total unique blocks found:", nrow(filtblocks_BTEXSN), "\n")
+
+# ------------------------------------------------------------------
+# 10. NEW STEP: Facility-block pairs
+# ------------------------------------------------------------------
+
+# 10a. Create buffers per facility (no union)
+tri_buffers <- st_buffer(tri_sf_proj, dist = 10000)
+
+# Directory for facility-block state outputs
+dir.create("~/TSCA/CRA/metdb_tsca/data/facility_blocks_states", showWarnings = FALSE)
+
+# 10b. Loop state by state, save facility-block pairs
+map_dfr(valid_states, function(st) {
+  outfile <- file.path("~/TSCA/CRA/metdb_tsca/data/facility_blocks_states", 
+                       paste0("facility_blocks_", st, ".csv"))
+  
+  if (file.exists(outfile)) {
+    return(read.csv(outfile, colClasses = "character"))
+  }
+  
+  # Load state blocks
+  blk <- blocks(state = st, year = 2020) %>%
+    st_transform(5070)
+  
+  # Intersections: gives facility–block matches
+  fb_pairs <- st_intersection(
+    tri_buffers %>% select(trifd),
+    blk %>% select(GEOID20)
+  ) %>%
+    st_drop_geometry() %>%
+    distinct() %>%
+    rename(GEOID = GEOID20)
+  
+  # Save state-level CSV
+  write.csv(fb_pairs, outfile, row.names = FALSE)
+  
+  fb_pairs
+}) -> facility_block_pairs
+
+# 10c. Combine all states
+facility_block_pairs_all <- facility_block_pairs %>% distinct()
+
+# 10d. Save final combined facility-block file
+write.csv(facility_block_pairs_all, 
+          file = "~/TSCA/CRA/metdb_tsca/data/BTEXSN_facility_block_pairs.csv", 
+          row.names = FALSE)
+
+cat("Total facility-block pairs found:", nrow(facility_block_pairs_all), "\n")
+
+```
+
+
+### chlor blocks ### (this needs to be updated to reflect what was done above for BTEXSN)
+
+
+#pull df of TRI facility IDs, their lat/longs, and NAICS code for facilities releasing BTEXSN, then filter for NAICS codes of interest
+```{r}
+#pull df from BQ
+SQL <- "
+SELECT DISTINCT
+  trifd,
+  latitude,
+  longitude,
+  primary_NAICS,
+  NAICS2,
+  NAICS3,
+  NAICS4,
+  NAICS5,
+  NAICS6
+FROM `edf-aq-data.tri.tri_basic_2017-2022`
+WHERE chemical IN (
+  'Trichloroethylene',
+  'Tetrachloroethylene',
+  'Carbon tetrachloride',
+  'Dichloromethane',
+  'Ethylidene dichloride',
+  '1,2-Dichloroethane'
+)
+"
+
+TRI_chlor = dbGetQuery(con, SQL)
+
+#filter for NAICS codes
+naics_codes <- naics$Code %>% as.character()
+
+TRI_chlor <- TRI_chlor %>%
+  filter(
+    primary_NAICS %in% naics_codes |
+    NAICS2 %in% naics_codes |
+    NAICS3 %in% naics_codes |
+    NAICS4 %in% naics_codes |
+    NAICS5 %in% naics_codes |
+    NAICS6 %in% naics_codes
+  )
+```
+
+
+
+#get list of blocks overlapping within 10km of any of these facilities
+```{r}
+# 1. TRI facilities into sf
+tri_sf <- TRI_chlor %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# 2. Project to CRS in meters (good for buffering)
+tri_sf_proj <- st_transform(tri_sf, 5070)
+
+# 3. 10 km buffer, union into one geometry
+tri_buffer_union <- st_buffer(tri_sf_proj, dist = 10000) %>%
+  st_union()
+
+# 4. Valid states: 50 states + DC only
+valid_states <- c(state.abb, "DC")
+
+# 5. Setup progress bar
+pb <- progress_bar$new(
+  format = "Processing :state [:bar] :percent | Found :n blocks",
+  total = length(valid_states), clear = FALSE, width = 80
+)
+
+# Directory to store intermediate results
+dir.create("~/TSCA/CRA/metdb_tsca/data/filtblocks_states_chlor", showWarnings = FALSE)
+
+# 6. Loop state-by-state with intermediate save
+map_dfr(valid_states, function(st) {
+  # Skip if already processed
+  outfile <- file.path("~/TSCA/CRA/metdb_tsca/data/filtblocks_states_chlor", paste0("blocks_", st, ".csv"))
+  if (file.exists(outfile)) {
+    pb$tick(tokens = list(state = st, n = "skipped"))
+    return(read.csv(outfile, colClasses = "character"))
+  }
+  
+  # Load blocks for one state
+  blk <- blocks(state = st, year = 2020) %>%
+    st_transform(5070)
+  
+  # Find overlaps
+  blk_overlap <- blk %>%
+    filter(st_intersects(., tri_buffer_union, sparse = FALSE))
+  
+  n_found <- nrow(blk_overlap)
+  
+  # Update progress bar
+  pb$tick(tokens = list(state = st, n = n_found))
+  
+  # Prepare output
+  df_out <- blk_overlap %>%
+    st_drop_geometry() %>%
+    select(GEOID20) %>%
+    distinct() %>%
+    rename(GEOID = GEOID20)
+  
+  # Save intermediate
+  write.csv(df_out, outfile, row.names = FALSE)
+  
+  df_out
+}) -> blocks_overlap
+
+# 7. Combine all states + deduplicate
+filtblocks_chlor <- blocks_overlap %>% distinct()
+
+# 8. Save final combined file
+write.csv(filtblocks_chlor, 
+          file = "~/TSCA/CRA/metdb_tsca/data/filtblocks_chlor.csv", 
+          row.names = FALSE)
+
+# 9. Optional sanity check
+cat("Total unique blocks found:", nrow(filtblocks_chlor), "\n")
+```
+
+
+
+
+
+
+
+
+

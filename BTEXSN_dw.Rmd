@@ -1,0 +1,724 @@
+---
+title: "Water data analysis for BTEXSN"
+author: "Paige Varner"
+date: "2025-06-04"
+output: html_document
+---
+
+
+#load libraries
+```{r}
+library("dplyr")
+library("tidyr")
+library("stringr")
+library("bigrquery")
+library("DBI")
+library("pheatmap")
+library("RColorBrewer")
+library("Rmisc")
+library("stats")
+library("rstatix")
+library("ggplot2")
+library("car")
+library("arrow")
+library("progressr")
+library("purrr")
+library("readr")
+library("haven")
+library("tidycensus")
+detach(package:Rmisc)
+detach(package:plyr)
+
+filtblocks = read.csv("~/TSCA/CRA/metdb_tsca/data/filtblocks_BTEXSN.csv")
+```
+
+
+#database connection
+```{r}
+bq_auth(email = NA)
+
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "edf-aq-data",
+  dataset = "TSCA",)
+
+bq_auth(email = NA)
+
+```
+
+## note: running DW analysis after creating a filtblocks_BTEXSN table in BQ during the ATS analysis phase so this table already exists, and subsequent analysis is filtering only for those blocks ##
+
+#summary table for assuming nd is zero (low) and nd is the LOD (high) overall and by child/adult populations (note: the N in these summaries is for block + endpoint combinations)
+```{r}
+# --- Overall low/high summary for PWS, filtered by filtblocks_BTEXSN ---
+SQL <- "
+WITH filtered_HIs AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = f.GEOID
+)
+SELECT 
+  low_up,
+  MIN(HI) AS min,
+  MAX(HI) AS max,
+  AVG(HI) AS mean,
+  APPROX_QUANTILES(HI, 2)[OFFSET(1)] AS median,
+  STDDEV(HI) AS std_dev,
+  STDDEV(HI) / SQRT(COUNT(HI)) AS std_error,
+  COUNT(HI) AS n
+FROM filtered_HIs
+GROUP BY low_up
+ORDER BY low_up
+"
+
+BTEXSN_HI_summary_low_up <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_summary_low_up, 
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HIsummary_low_up.csv",
+  row.names = FALSE
+)
+
+# --- Low/high summary by population for PWS ---
+SQL <- "
+WITH filtered_HIs AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = f.GEOID
+)
+SELECT 
+  low_up,
+  pop,
+  MIN(HI) AS min,
+  MAX(HI) AS max,
+  AVG(HI) AS mean,
+  APPROX_QUANTILES(HI, 2)[OFFSET(1)] AS median,
+  STDDEV(HI) AS std_dev,
+  STDDEV(HI) / SQRT(COUNT(HI)) AS std_error,
+  COUNT(HI) AS n
+FROM filtered_HIs
+GROUP BY low_up, pop
+ORDER BY low_up, pop
+"
+
+BTEXSN_HI_summary_low_up_pop <- dbGetQuery(con, SQL)
+
+write.csv(
+  BTEXSN_HI_summary_low_up_pop, 
+  file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HIsummary_low_up_pop.csv",
+  row.names = FALSE
+)
+
+```
+
+
+## moving forward - analysis conducted for assuming non-detects are 1/2 the LOD; this pulls from BQ views and tables that end in _half ##
+
+
+#summary tables (note: the N in these summaries is for block + endpoint combinations, except when broken out by endpoint)
+```{r}
+# Overall
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = CAST(f.GEOID AS STRING)
+)
+SELECT 
+  MIN(HI) AS min,
+  MAX(HI) AS max,
+  AVG(HI) AS mean,
+  APPROX_QUANTILES(HI, 2)[OFFSET(1)] AS median,
+  STDDEV(HI) AS std_dev,
+  STDDEV(HI) / SQRT(COUNT(HI)) AS std_error,
+  COUNT(HI) AS n
+FROM filtered_blocks
+"
+
+BTEXSN_HI_summary <- dbGetQuery(con, SQL)
+
+write.csv(BTEXSN_HI_summary, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HIsummary.csv")
+
+
+# Population
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = CAST(f.GEOID AS STRING)
+)
+SELECT 
+  pop,
+  MIN(HI) AS min,
+  MAX(HI) AS max,
+  AVG(HI) AS mean,
+  APPROX_QUANTILES(HI, 2)[OFFSET(1)] AS median,
+  STDDEV(HI) AS std_dev,
+  STDDEV(HI) / SQRT(COUNT(HI)) AS std_error,
+  COUNT(HI) AS n
+FROM filtered_blocks
+GROUP BY pop
+ORDER BY pop
+"
+
+BTEXSN_HI_summary_pop <- dbGetQuery(con, SQL)
+
+write.csv(BTEXSN_HI_summary_pop, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HIsummary_pop.csv")
+
+
+# Endpoint
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = CAST(f.GEOID AS STRING)
+)
+SELECT 
+  endpoint,
+  MIN(HI) AS min,
+  MAX(HI) AS max,
+  AVG(HI) AS mean,
+  APPROX_QUANTILES(HI, 2)[OFFSET(1)] AS median,
+  STDDEV(HI) AS std_dev,
+  STDDEV(HI) / SQRT(COUNT(HI)) AS std_error,
+  COUNT(HI) AS n
+FROM filtered_blocks
+GROUP BY endpoint
+ORDER BY endpoint
+"
+
+BTEXSN_HI_summary_endpoint <- dbGetQuery(con, SQL)
+
+write.csv(BTEXSN_HI_summary_endpoint, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HIsummary_by_endpoint.csv")
+
+
+# Population and endpoint
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON t.geoid20 = CAST(f.GEOID AS STRING)
+)
+SELECT 
+  pop,
+  endpoint,
+  MIN(HI) AS min,
+  MAX(HI) AS max,
+  AVG(HI) AS mean,
+  APPROX_QUANTILES(HI, 2)[OFFSET(1)] AS median,
+  STDDEV(HI) AS std_dev,
+  STDDEV(HI) / SQRT(COUNT(HI)) AS std_error,
+  COUNT(HI) AS n
+FROM filtered_blocks
+GROUP BY pop, endpoint
+ORDER BY pop, endpoint
+"
+
+BTEXSN_HI_summary_pop_endpoint <- dbGetQuery(con, SQL)
+
+write.csv(BTEXSN_HI_summary_pop_endpoint, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HIsummary_pop_endpoint.csv")
+
+```
+
+
+
+#delta for each pollutant
+```{r}
+# overall deltas
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT hq.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HQs_half` hq
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON CAST(hq.geoid20 AS STRING) = f.GEOID
+)
+SELECT
+  hq.chem,
+  COUNT(*) AS n,
+  AVG(hq.hq) AS avg_HQ,
+  AVG(hi.HI) AS avg_HI,
+  SAFE_DIVIDE(AVG(hi.HI) - AVG(hq.hq), 1) AS delta_avg
+FROM filtered_blocks hq
+JOIN `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` hi
+  ON hq.geoid20 = hi.geoid20
+     AND hq.endpoint = hi.endpoint
+GROUP BY hq.chem
+ORDER BY hq.chem
+"
+
+BTEXSN_chem_avg_deltas <- dbGetQuery(con, SQL)
+write.csv(BTEXSN_chem_avg_deltas, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/avg_deltas.csv")
+
+
+# Deltas for blocks with HI >= 1
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT hq.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HQs_half` hq
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON CAST(hq.geoid20 AS STRING) = f.GEOID
+)
+SELECT
+  hq.chem,
+  COUNT(*) AS n,
+  AVG(hq.hq) AS avg_HQ,
+  AVG(hi.HI) AS avg_HI,
+  SAFE_DIVIDE(AVG(hi.HI) - AVG(hq.hq), 1) AS delta_avg
+FROM filtered_blocks hq
+JOIN `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` hi
+  ON hq.geoid20 = hi.geoid20
+     AND hq.endpoint = hi.endpoint
+WHERE hi.HI >= 1
+GROUP BY hq.chem
+ORDER BY hq.chem
+"
+
+BTEXSN_chem_avg_deltas_1 <- dbGetQuery(con, SQL)
+write.csv(BTEXSN_chem_avg_deltas_1, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI1/avg_deltas_HI1.csv")
+
+
+# Deltas for blocks with HI >= 0.1
+SQL <- "
+WITH filtered_blocks AS (
+  SELECT hq.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HQs_half` hq
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON CAST(hq.geoid20 AS STRING) = f.GEOID
+)
+SELECT
+  hq.chem,
+  COUNT(*) AS n,
+  AVG(hq.hq) AS avg_HQ,
+  AVG(hi.HI) AS avg_HI,
+  SAFE_DIVIDE(AVG(hi.HI) - AVG(hq.hq), 1) AS delta_avg
+FROM filtered_blocks hq
+JOIN `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` hi
+  ON hq.geoid20 = hi.geoid20
+     AND hq.endpoint = hi.endpoint
+WHERE hi.HI >= 0.1
+GROUP BY hq.chem
+ORDER BY hq.chem
+"
+
+BTEXSN_chem_avg_deltas_01 <- dbGetQuery(con, SQL)
+write.csv(BTEXSN_chem_avg_deltas_01, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/avg_deltas_HI01.csv")
+
+```
+
+
+#CDFs for children and adults
+```{r}
+# --- 1. Pull the data ---
+project_id <- "edf-aq-data"
+
+SQL <- "
+SELECT
+  t.geoid20,
+  t.endpoint,
+  t.pop,
+  t.HI
+FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON t.geoid20 = f.GEOID
+"
+
+BTEXS_PWS_HIs_filtered <- bq_project_query(project_id, SQL) %>%
+  bq_table_download()
+
+# --- 2. Pre-compute CDF by population ---
+BTEXS_cdf <- BTEXS_PWS_HIs_filtered %>%
+  group_by(pop) %>%
+  arrange(HI) %>%
+  mutate(cdf = row_number() / n()) %>%
+  ungroup()
+
+# Optional: thin points (every 10th to speed up plotting)
+BTEXS_cdf_sample <- BTEXS_cdf %>%
+  group_by(pop) %>%
+  slice(seq(1, n(), by = 10)) %>%
+  ungroup()
+
+# --- 3. Plot ---
+cdf_plot <- ggplot(BTEXS_cdf_sample, aes(x = HI, y = cdf)) +
+  geom_line() +
+  # vertical reference lines for thresholds
+  geom_vline(xintercept = c(0.1, 1), linetype = "dotted", color = "black") +
+  scale_x_log10() +
+  labs(
+    title = "CDF of PWS HI (BTEXS, Children vs Adults)",
+    x = "HI value (log scale)",
+    y = "P(HI ≤ x)"
+  ) +
+  facet_wrap(~pop, scales = "free_y") +
+  theme_minimal(base_size = 14)
+
+cdf_plot
+
+ggsave(
+  filename = "BTEXSN_PWS_cdf.png",
+  device = "png",
+  plot = cdf_plot,
+  path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/",
+  width = 7, height = 5
+)
+
+```
+
+
+
+#######################################
+
+### analysis with HI threshold of 0.1 (no blocks above 1)
+
+#######################################
+
+
+
+# Count of blocks with HIs above 0.1 for further analysis and HQs for those blocks
+```{r}
+#overall
+SQL <- "
+WITH filtered_HIs AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON CAST(t.geoid20 AS STRING) = f.GEOID
+)
+
+SELECT
+  'HI' AS HI_type,
+  COUNT(DISTINCT CASE WHEN HI > 0.1 THEN geoid20 END) AS unique_blocks_above_01,
+  COUNT(DISTINCT geoid20) AS total_unique_blocks,
+  COUNT(CASE WHEN HI > 0.1 THEN 1 END) AS total_exceedances,
+  COUNT(*) AS total_block_endpoint_combos
+FROM filtered_HIs;
+"
+
+BTEXS_blocks_HIsabove01 <- dbGetQuery(con, SQL)
+
+write.csv(BTEXS_blocks_HIsabove01, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/blocks_HIsabove01_summary.csv",
+          row.names = FALSE)
+
+
+#for each population
+SQL <- "
+WITH filtered_HIs AS (
+  SELECT t.*
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+  JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+    ON CAST(t.geoid20 AS STRING) = f.GEOID
+)
+SELECT
+  pop,
+  COUNT(DISTINCT CASE WHEN HI > 0.1 THEN geoid20 END) AS unique_blocks_above_01,
+  COUNT(DISTINCT geoid20) AS total_unique_blocks,
+  COUNT(CASE WHEN HI > 0.1 THEN 1 END) AS total_exceedances,
+  COUNT(*) AS total_block_endpoint_combos
+FROM filtered_HIs
+GROUP BY pop
+ORDER BY pop;
+"
+
+BTEXS_blocks_HIsabove01_by_pop <- dbGetQuery(con, SQL)
+
+write.csv(BTEXS_blocks_HIsabove01_by_pop, 
+          file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/blocks_HIsabove01_bypop_summary.csv",
+          row.names = FALSE)
+```
+
+
+# Pull HI and HQ dfs of HIs > 0.1
+```{r}
+# --- pull blocks with HI > 0.1 filtered by filtblocks_BTEXSN ---
+SQL_hi <- "
+SELECT t.*
+FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half` t
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON CAST(t.geoid20 AS STRING) = f.GEOID
+WHERE HI > 0.1
+"
+
+BTEXS_exceedances <- dbGetQuery(con, SQL_hi)
+
+# --- pull HQ data for those blocks and endpoints ---
+SQL_hq <- "
+SELECT hq.*
+FROM `edf-aq-data.TSCA.BTEXS_PWS_HQs_half` hq
+JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
+  ON CAST(hq.geoid20 AS STRING) = f.GEOID
+JOIN (
+  SELECT geoid20, endpoint
+  FROM `edf-aq-data.TSCA.BTEXS_PWS_HIs_half`
+  WHERE HI > 0.1
+) t
+  ON hq.geoid20 = t.geoid20 AND hq.endpoint = t.endpoint
+"
+
+BTEXS_HQs_HIexceedances <- dbGetQuery(con, SQL_hq)
+
+```
+
+
+
+# Blocks exceeding more than one endpoint
+```{r}
+#overall
+blocks_mult_endpoints <- BTEXS_exceedances %>%
+  group_by(geoid20) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(sort(unique(endpoint)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_endpoints_exceeding > 1)
+
+BTEXS_mult_endpoints <- BTEXS_exceedances %>%
+  semi_join(blocks_mult_endpoints, by = "geoid20") %>%
+  left_join(blocks_mult_endpoints, by = "geoid20")
+
+write.csv(blocks_mult_endpoints, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/blocks_mult_endpoints.csv", row.names = FALSE)
+
+#adult (no blocks exceed multiple endpoints in adult populations)
+blocks_mult_endpoints_ad <- BTEXS_exceedances %>%
+  filter(pop == "ad") %>%
+  group_by(geoid20) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(sort(unique(endpoint)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_endpoints_exceeding > 1)
+
+BTEXS_mult_endpoints_ad <- BTEXS_exceedances %>%
+  filter(pop == "ad") %>%
+  semi_join(blocks_mult_endpoints_ad, by = "geoid20") %>%
+  left_join(blocks_mult_endpoints_ad, by = "geoid20")
+
+write.csv(blocks_mult_endpoints_ad, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/blocks_mult_endpoints_ad.csv", row.names = FALSE)
+
+
+#child
+blocks_mult_endpoints_ch <- BTEXS_exceedances %>%
+  filter(pop == "ch") %>%
+  group_by(geoid20) %>%
+  summarise(
+    n_endpoints_exceeding = n_distinct(endpoint),
+    endpoints = paste(sort(unique(endpoint)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_endpoints_exceeding > 1)
+
+BTEXS_mult_endpoints_ch <- BTEXS_exceedances %>%
+  filter(pop == "ch") %>%
+  semi_join(blocks_mult_endpoints, by = "geoid20") %>%
+  left_join(blocks_mult_endpoints, by = "geoid20")
+
+write.csv(blocks_mult_endpoints, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/blocks_mult_endpoints_ch.csv", row.names = FALSE)
+
+```
+
+
+#graph average HQs for each endpoint that was exceeded in any block group to see which chemicals contribute 
+```{r}
+# Join HI and HQ datasets together 
+BTEXS_exceedances_with_HQs <- BTEXS_exceedances %>%
+  left_join(
+    BTEXS_HQs_HIexceedances %>%
+      select(geoid20, endpoint, pop, hq, chem),
+    by = c("geoid20", "endpoint", "pop")
+  )
+
+# HQ averages by endpoint, chemical, and population
+HQ_averages <- BTEXS_exceedances_with_HQs %>%
+  group_by(endpoint, chem, pop) %>%
+  summarise(
+    n = sum(!is.na(hq)),
+    avg_HQ = mean(hq, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(HQ_averages, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/HQ_averages.csv")
+
+# stacked bar plot faceted by pop
+HQ_averages <- HQ_averages %>%
+  mutate(pop = dplyr::recode(pop,
+                             "ad" = "Adult",
+                             "ch" = "Child"))
+
+BTEXS_HQtot_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ, fill = chem)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Average HQ by Endpoint, Pollutant, and Population Group",
+    x = "Endpoint",
+    y = "Average HQ",
+    fill = "Pollutant"
+  ) +
+  facet_wrap(~ pop) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+BTEXS_HQtot_bar
+
+ggsave(
+  filename = "bar_avgHQ_endpoints_by_pop.png",
+  device = "png",
+  plot = BTEXS_HQtot_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/",
+  width = 7,
+  height = 5
+)
+
+```
+
+
+# Chemicals contributing to HI exceedances for adults - none where there's an HI above 0.1 where an HQ wasn't already above 0.1, so no graph here
+```{r}
+
+# Compute max HQ per block/endpoint and filter blocks where HI > 0.1 but HQ_max ≤ 0.1
+blocks_HI_only <- BTEXS_exceedances_with_HQs %>%
+  group_by(geoid20, endpoint) %>%
+  mutate(max_HQ_block = max(hq, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(pop == "ad" & HI > 0.1 & (is.na(max_HQ_block) | max_HQ_block <= 0.1))
+
+```
+
+
+# Chemicals contributing to HI exceedances for children (need to work on this, it's not working)
+```{r}
+# 1. Join HI and HQ datasets (child population only)
+BTEXS_exceedances_with_HQs <- BTEXS_exceedances %>%
+  filter(pop == "ch") %>%
+  left_join(
+    BTEXS_HQs_HIexceedances %>%
+      filter(pop == "ch") %>%
+      select(geoid20, endpoint, hq, chem),
+    by = c("geoid20", "endpoint")
+  )
+
+# 2. Compute max HI and max HQ per block/endpoint
+blocks_HI_only <- BTEXS_exceedances_with_HQs %>%
+  group_by(geoid20, endpoint) %>%
+  summarise(
+    HI_block = max(HI, na.rm = TRUE),
+    HQ_block_max = max(hq, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(HI_block > 0.1 & (is.na(HQ_block_max) | HQ_block_max <= 0.1))
+
+# 3. Select top 10 blocks per endpoint by HI
+top10_blocks_per_endpoint <- blocks_HI_only %>%
+  group_by(endpoint) %>%
+  slice_max(order_by = HI_block, n = 10, with_ties = TRUE) %>%
+  ungroup()
+
+# 4. Keep all HQ rows for these top 10 blocks
+BTEXS_exceedances_HI_only_top10 <- BTEXS_exceedances_with_HQs %>%
+  semi_join(top10_blocks_per_endpoint, by = c("geoid20", "endpoint"))
+
+# 5. Create block labels per endpoint
+BTEXS_exceedances_HI_only_top10 <- BTEXS_exceedances_HI_only_top10 %>%
+  group_by(endpoint) %>%
+  mutate(block_label = paste0("Block ", dense_rank(desc(HI)))) %>%
+  ungroup()
+
+# 6. Plot HQ by pollutant (not filtering for top 10 for now because it's not working)
+BTEXS_HQblocks_bar <- ggplot(BTEXS_exceedances_with_HQs, 
+                             aes(x = geoid20, y = hq, fill = chem)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ endpoint, scales = "free") +
+  labs(
+    title = "HQ by Pollutant and Blocks per Endpoint (HI > 0.1, Children, HQ ≤ 0.1)",
+    x = "Block (ranked by HI)",
+    y = "HQ",
+    fill = "Pollutant"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+BTEXS_HQblocks_bar
+
+ggsave(filename = "bar_HQ_blocks_child.png", 
+       device = "png", 
+       plot = BTEXS_HQblocks_bar, 
+       path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/", 
+       width = 7, height = 5)
+
+```
+
+
+#population counts for exceedances 
+```{r}
+# Step 1: Get distinct state-county combinations from BTEXS_exceedances (already filtered for blocks of interest)
+state_county_pairs <- BTEXS_exceedances %>%
+  mutate(
+    statefp = substr(geoid20, 1, 2),
+    countyfp = substr(geoid20, 3, 5)
+  ) %>%
+  distinct(statefp, countyfp)
+
+# Step 2: Function to get block-level population for a state-county
+get_block_pop <- function(statefp, countyfp) {
+  tryCatch({
+    get_decennial(
+      geography = "block",
+      variables = "P1_001N",
+      year = 2020,
+      sumfile = "pl",
+      state = statefp,
+      county = countyfp,
+      geometry = FALSE,
+      output = "wide"
+    ) %>%
+      rename(census_population = P1_001N)
+  }, error = function(e) {
+    message(paste("Error in", statefp, countyfp, ":", e$message))
+    return(NULL)
+  })
+}
+
+# Step 3: Loop through all state-county combinations and combine results
+census_pop_all <- map2_dfr(state_county_pairs$statefp, state_county_pairs$countyfp, get_block_pop)
+
+# Step 4: Join with exceedances
+BTEXS_with_pop <- BTEXS_exceedances %>%
+  left_join(census_pop_all, by = c("geoid20" = "GEOID"))
+
+# Step 5: Filter HI > 0.1 and summarise population for unique blocks
+pop_summary_blocks <- BTEXS_with_pop %>%
+  filter(HI > 0.1) %>%
+  group_by(pop, geoid20) %>%   # ensure unique block-level counts
+  summarise(block_pop = first(census_population), .groups = "drop") %>%
+  group_by(pop) %>%
+  summarise(
+    total_census_population = sum(block_pop, na.rm = TRUE),
+    avg_census_population   = mean(block_pop, na.rm = TRUE),
+    n_unique_blocks         = n(),
+    .groups = "drop"
+  )
+
+# Step 6: Write output to CSV
+write_csv(
+  pop_summary_blocks,
+  "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/population_summary.csv"
+)
+```
+
+
+
+
+
