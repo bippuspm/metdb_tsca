@@ -205,7 +205,7 @@ cat("Total facility-block pairs found:", nrow(facility_block_pairs_all), "\n")
 ```
 
 
-### chlor blocks ### (this needs to be updated to reflect what was done above for BTEXSN)
+### chlor blocks ### 
 
 
 #pull df of TRI facility IDs, their lat/longs, and NAICS code for facilities releasing BTEXSN, then filter for NAICS codes of interest
@@ -261,7 +261,7 @@ tri_sf <- TRI_chlor %>%
 # 2. Project to CRS in meters (good for buffering)
 tri_sf_proj <- st_transform(tri_sf, 5070)
 
-# 3. 10 km buffer, union into one geometry
+# 3. 10 km buffer, union into one geometry (for block-only overlap check)
 tri_buffer_union <- st_buffer(tri_sf_proj, dist = 10000) %>%
   st_union()
 
@@ -275,12 +275,12 @@ pb <- progress_bar$new(
 )
 
 # Directory to store intermediate results
-dir.create("~/TSCA/CRA/metdb_tsca/data/filtblocks_states_chlor", showWarnings = FALSE)
+dir.create("~/TSCA/CRA/metdb_tsca/data/filtblocks_states", showWarnings = FALSE)
 
-# 6. Loop state-by-state with intermediate save
+# 6. Loop state-by-state with intermediate save (blocks only)
 map_dfr(valid_states, function(st) {
   # Skip if already processed
-  outfile <- file.path("~/TSCA/CRA/metdb_tsca/data/filtblocks_states_chlor", paste0("blocks_", st, ".csv"))
+  outfile <- file.path("~/TSCA/CRA/metdb_tsca/data/filtblocks_states", paste0("blocks_", st, ".csv"))
   if (file.exists(outfile)) {
     pb$tick(tokens = list(state = st, n = "skipped"))
     return(read.csv(outfile, colClasses = "character"))
@@ -290,7 +290,7 @@ map_dfr(valid_states, function(st) {
   blk <- blocks(state = st, year = 2020) %>%
     st_transform(5070)
   
-  # Find overlaps
+  # Find overlaps with union of all buffers
   blk_overlap <- blk %>%
     filter(st_intersects(., tri_buffer_union, sparse = FALSE))
   
@@ -315,15 +315,63 @@ map_dfr(valid_states, function(st) {
 # 7. Combine all states + deduplicate
 filtblocks_chlor <- blocks_overlap %>% distinct()
 
-# 8. Save final combined file
+# 8. Save final combined file (block-only)
 write.csv(filtblocks_chlor, 
           file = "~/TSCA/CRA/metdb_tsca/data/filtblocks_chlor.csv", 
           row.names = FALSE)
 
 # 9. Optional sanity check
 cat("Total unique blocks found:", nrow(filtblocks_chlor), "\n")
-```
 
+# ------------------------------------------------------------------
+# 10. NEW STEP: Facility-block pairs
+# ------------------------------------------------------------------
+
+# 10a. Create buffers per facility (no union)
+tri_buffers <- st_buffer(tri_sf_proj, dist = 10000)
+
+# Directory for facility-block state outputs
+dir.create("~/TSCA/CRA/metdb_tsca/data/facility_blocks_states", showWarnings = FALSE)
+
+# 10b. Loop state by state, save facility-block pairs
+map_dfr(valid_states, function(st) {
+  outfile <- file.path("~/TSCA/CRA/metdb_tsca/data/facility_blocks_states", 
+                       paste0("facility_blocks_", st, ".csv"))
+  
+  if (file.exists(outfile)) {
+    return(read.csv(outfile, colClasses = "character"))
+  }
+  
+  # Load state blocks
+  blk <- blocks(state = st, year = 2020) %>%
+    st_transform(5070)
+  
+  # Intersections: gives facility–block matches
+  fb_pairs <- st_intersection(
+    tri_buffers %>% select(trifd),
+    blk %>% select(GEOID20)
+  ) %>%
+    st_drop_geometry() %>%
+    distinct() %>%
+    rename(GEOID = GEOID20)
+  
+  # Save state-level CSV
+  write.csv(fb_pairs, outfile, row.names = FALSE)
+  
+  fb_pairs
+}) -> facility_block_pairs
+
+# 10c. Combine all states
+facility_block_pairs_all <- facility_block_pairs %>% distinct()
+
+# 10d. Save final combined facility-block file
+write.csv(facility_block_pairs_all, 
+          file = "~/TSCA/CRA/metdb_tsca/data/chlor_facility_block_pairs.csv", 
+          row.names = FALSE)
+
+cat("Total facility-block pairs found:", nrow(facility_block_pairs_all), "\n")
+
+```
 
 
 

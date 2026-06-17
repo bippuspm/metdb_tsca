@@ -26,6 +26,8 @@ library("purrr")
 library("readr")
 library("haven")
 library("tidycensus")
+library("ggokabeito")
+library("cowplot")
 detach(package:Rmisc)
 detach(package:plyr)
 
@@ -41,8 +43,6 @@ con <- dbConnect(
   bigrquery::bigquery(),
   project = "edf-aq-data",
   dataset = "TSCA",)
-
-bq_auth(email = NA)
 
 ```
 
@@ -335,29 +335,33 @@ JOIN `edf-aq-data.TSCA.filtblocks_BTEXSN` f
 BTEXS_PWS_HIs_filtered <- bq_project_query(project_id, SQL) %>%
   bq_table_download()
 
-# --- 2. Pre-compute CDF by population ---
+# --- 2. Pre-compute CDF by population AND endpoint ---
 BTEXS_cdf <- BTEXS_PWS_HIs_filtered %>%
-  group_by(pop) %>%
+  group_by(pop, endpoint) %>%
   arrange(HI) %>%
   mutate(cdf = row_number() / n()) %>%
   ungroup()
 
 # Optional: thin points (every 10th to speed up plotting)
 BTEXS_cdf_sample <- BTEXS_cdf %>%
-  group_by(pop) %>%
+  group_by(pop, endpoint) %>%
   slice(seq(1, n(), by = 10)) %>%
   ungroup()
 
 # --- 3. Plot ---
-cdf_plot <- ggplot(BTEXS_cdf_sample, aes(x = HI, y = cdf)) +
-  geom_line() +
+cdf_plot <- ggplot(
+  BTEXS_cdf_sample,
+  aes(x = HI, y = cdf, group = endpoint, color = endpoint)
+) +
+  geom_line(linewidth = 1) +
   # vertical reference lines for thresholds
   geom_vline(xintercept = c(0.1, 1), linetype = "dotted", color = "black") +
   scale_x_log10() +
   labs(
     title = "CDF of PWS HI (BTEXS, Children vs Adults)",
     x = "HI value (log scale)",
-    y = "P(HI ≤ x)"
+    y = "P(HI ≤ x)",
+    color = "Endpoint"
   ) +
   facet_wrap(~pop, scales = "free_y") +
   theme_minimal(base_size = 14)
@@ -369,7 +373,8 @@ ggsave(
   device = "png",
   plot = cdf_plot,
   path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/",
-  width = 7, height = 5
+  width = 7,
+  height = 5
 )
 
 ```
@@ -529,7 +534,7 @@ write.csv(blocks_mult_endpoints, file = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Wat
 ```
 
 
-#graph average HQs for each endpoint that was exceeded in any block group to see which chemicals contribute 
+#graph average HQs for each endpoint that was exceeded in any block group to see which chemicals contribute (don't think we need to present this figure for now, as the data will be provided in tables; however, if we want it, will need to clean it)
 ```{r}
 # Join HI and HQ datasets together 
 BTEXS_exceedances_with_HQs <- BTEXS_exceedances %>%
@@ -595,7 +600,7 @@ blocks_HI_only <- BTEXS_exceedances_with_HQs %>%
 ```
 
 
-# Chemicals contributing to HI exceedances for children (need to work on this, it's not working)
+# Chemicals contributing to HI exceedances for children
 ```{r}
 # 1. Join HI and HQ datasets (child population only)
 BTEXS_exceedances_with_HQs <- BTEXS_exceedances %>%
@@ -620,44 +625,116 @@ blocks_HI_only <- BTEXS_exceedances_with_HQs %>%
 # 3. Select top 10 blocks per endpoint by HI
 top10_blocks_per_endpoint <- blocks_HI_only %>%
   group_by(endpoint) %>%
-  slice_max(order_by = HI_block, n = 10, with_ties = TRUE) %>%
+  arrange(desc(HI_block)) %>%
+  slice_head(n = 10) %>%
   ungroup()
 
-# 4. Keep all HQ rows for these top 10 blocks
+# 4. Keep HQ rows only for the top 10 blocks per endpoint
 BTEXS_exceedances_HI_only_top10 <- BTEXS_exceedances_with_HQs %>%
-  semi_join(top10_blocks_per_endpoint, by = c("geoid20", "endpoint"))
+  inner_join(
+    top10_blocks_per_endpoint %>%
+      select(geoid20, endpoint),
+    by = c("geoid20", "endpoint")
+  )
 
-# 5. Create block labels per endpoint
 BTEXS_exceedances_HI_only_top10 <- BTEXS_exceedances_HI_only_top10 %>%
-  group_by(endpoint) %>%
-  mutate(block_label = paste0("Block ", dense_rank(desc(HI)))) %>%
-  ungroup()
+  mutate(
+    chem = dplyr::recode(
+      chem,
+      benzene = "Benzene",
+      ethylbenzene = "Ethylbenzene",
+      styrene = "Styrene",
+      toluene = "Toluene",
+      xylenes = "Xylenes"
+    )
+  )
 
-# 6. Plot HQ by pollutant (not filtering for top 10 for now because it's not working)
-BTEXS_HQblocks_bar <- ggplot(BTEXS_exceedances_with_HQs, 
-                             aes(x = geoid20, y = hq, fill = chem)) +
+# 5. Add block-level HI ranking (use HI_block from selection table)
+block_labels <- top10_blocks_per_endpoint %>%
+  group_by(endpoint) %>%
+  arrange(desc(HI_block), geoid20) %>%
+  mutate(block_label = paste0("Block ", row_number())) %>%
+  ungroup() %>%
+  select(geoid20, endpoint, block_label)
+
+# Join labels back to plotting dataset
+BTEXS_exceedances_HI_only_top10 <- BTEXS_exceedances_HI_only_top10 %>%
+  left_join(block_labels, by = c("geoid20", "endpoint"))
+
+
+# 6. Plot ONLY the top-10 dataset
+BTEXS_HQblocks_bar <- ggplot(
+  BTEXS_exceedances_HI_only_top10,
+  aes(x = block_label, y = hq, fill = chem)
+) +
   geom_bar(stat = "identity") +
-  facet_wrap(~ endpoint, scales = "free") +
-  labs(
-    title = "HQ by Pollutant and Blocks per Endpoint (HI > 0.1, Children, HQ ≤ 0.1)",
-    x = "Block (ranked by HI)",
-    y = "HQ",
-    fill = "Pollutant"
+  geom_hline(
+    yintercept = 0.1,
+    linetype = "dotted",
+    linewidth = 0.8
   ) +
-  theme_minimal() +
+  facet_wrap(~ endpoint, scales = "free_x") +
+  scale_fill_okabe_ito() +
+  labs(
+    x = "Blocks",
+    y = "Hazard Quotient (HQ)",
+    fill = "Chemical"
+  ) +
+  theme_minimal(base_size = 12) +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(size = 10, face = "bold")
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.position = "right"
   )
 
 BTEXS_HQblocks_bar
 
-ggsave(filename = "bar_HQ_blocks_child.png", 
-       device = "png", 
-       plot = BTEXS_HQblocks_bar, 
-       path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/", 
-       width = 7, height = 5)
+ggsave(
+  filename = "bar_HQ_blocks_child.png",
+  plot = BTEXS_HQblocks_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/",
+  width = 7,
+  height = 5,
+  dpi = 600
+)
 
+#save ggplot object for later paneling in the BTEXSN_dw.Rmd
+saveRDS(BTEXS_HQblocks_bar, "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/plot_B.rds")
+
+# Total child HI exceedances = 1,827
+n_HI_exceedances_child <- BTEXS_exceedances_with_HQs %>%
+  group_by(geoid20, endpoint) %>%
+  summarise(
+    HI_block = max(HI, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(HI_block > 0.1) %>%
+  nrow()
+
+# Child HI exceedances where no individual HQ exceeds 0.1 = 29
+n_cumulative_only_child <- BTEXS_exceedances_with_HQs %>%
+  group_by(geoid20, endpoint) %>%
+  summarise(
+    HI_block = max(HI, na.rm = TRUE),
+    HQ_block_max = max(hq, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    HI_block > 0.1 &
+      (is.na(HQ_block_max) | HQ_block_max <= 0.1)
+  ) %>%
+  nrow()
+
+# Percent attributable solely to cumulative effects = 1.59%
+pct_cumulative_only_child <-
+  100 * n_cumulative_only_child / n_HI_exceedances_child
+
+# Display results
+n_HI_exceedances_child
+n_cumulative_only_child
+pct_cumulative_only_child
 ```
 
 
@@ -717,6 +794,73 @@ write_csv(
   "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/population_summary.csv"
 )
 ```
+
+
+
+######### COMBINING PLOTS FOR PUBLICATION ###########
+
+
+#figure of HQs of each chemical for relevant endpoints in example blocks for A) air (all sources), and B) water (children) to show how considering more than one chemical pushes thresholds compared to just one chemical
+```{r}
+pA <- readRDS("~/TSCA/CRA/metdb_tsca/output/BTEXSN/Air/HI01/plot_A.rds")
+pB <- readRDS("~/TSCA/CRA/metdb_tsca/output/BTEXSN/Water/HI01/plot_B.rds")
+
+#remove legends and extract from only plot A
+pA <- pA + theme(legend.position = "none")
+pB <- pB + theme(legend.position = "none")
+
+legend <- get_legend(
+  pA +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal"
+    )
+)
+
+#combine 
+top_row <- plot_grid(
+  pA,
+  pB,
+  labels = c("A", "B"),
+  nrow = 1,
+  align = "hv"
+)
+
+#add shared legend
+final_fig <- plot_grid(
+  top_row,
+  legend,
+  ncol = 1,
+  rel_heights = c(1, 0.15)
+)
+
+#save
+ggsave(
+  filename = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/contributions_blocks_combined.png",
+  plot = final_fig,
+  width = 12,
+  height = 6,
+  dpi = 600
+)
+
+ggsave(
+  filename = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/contributions_blocks_combined.tiff",
+  plot = final_fig,
+  width = 12,
+  height = 6,
+  dpi = 600,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = "~/TSCA/CRA/metdb_tsca/output/BTEXSN/Combined/contributions_blocks_combined.pdf",
+  plot = final_fig,
+  width = 12,
+  height = 6,
+  device = cairo_pdf
+)
+```
+
 
 
 

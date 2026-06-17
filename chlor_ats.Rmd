@@ -25,6 +25,9 @@ library("purrr")
 library("readr")
 library("haven")
 library("stringr")
+library("ggokabeito")
+library("magick")
+library("cowplot")
 detach(package:Rmisc)
 detach(package:plyr)
 
@@ -34,12 +37,13 @@ filtblocks = read.csv("~/TSCA/CRA/metdb_tsca/data/filtblocks_chlor.csv")
 
 #database connection
 ```{r}
+bq_auth(email = NA)
+
 con <- dbConnect(
   bigrquery::bigquery(),
   project = "edf-aq-data",
   dataset = "airtoxscreen",)
 
-bq_auth(email = NA)
 ```
 
 
@@ -452,7 +456,7 @@ chlor_cdf_sample <- chlor_cdf %>%
   ungroup()
 
 # --- 4. Plot ---
-cdf_plot <- ggplot(chlor_cdf_sample, aes(x = HI_value, y = cdf)) +
+cdf_plot <- ggplot(chlor_cdf_sample, aes(x = HI_value, y = cdf, group = endpoint, color = endpoint)) +
   geom_line() +
   # vertical reference lines for thresholds
   geom_vline(xintercept = c(0.1, 1), linetype = "dotted", color = "black") +
@@ -614,70 +618,116 @@ chlor_exceedances_HI_only <- chlor_exceedances_with_HQs %>%
 HQ_averages <- chlor_exceedances_with_HQs %>%
   group_by(endpoint, pollutant_name) %>%
   summarise(
-    avg_HQ_tot   = mean(HQ_tot, na.rm = TRUE),
-    avg_HQ_pt    = mean(HQ_pt, na.rm = TRUE),
-    avg_HQ_other = mean(HQ_other, na.rm = TRUE),
+    avg_HQ_tot = mean(HQ_tot, na.rm = TRUE),
+    avg_HQ_pt  = mean(HQ_pt, na.rm = TRUE),
     n = n(),
     .groups = "drop"
   )
 
-write.csv(HQ_averages, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/HQ_averages.csv")
+# rename chemicals and set fixed ordering for consistent colors
+HQ_averages <- HQ_averages %>%
+  mutate(
+    pollutant_name = dplyr::recode(
+      pollutant_name,
+      "CARBON TETRACHLORIDE" = "Carbon tetrachloride",
+      "ETHYLENE DICHLORIDE (1,2-DICHLOROETHANE)" = "1,2-Dichloroethane",
+      "ETHYLIDENE DICHLORIDE (1,1-DICHLOROETHANE)" = "1,1-Dichloroethane",
+      "METHYLENE CHLORIDE" = "Methylene chloride",
+      "TETRACHLOROETHYLENE" = "PCE",
+      "TRICHLOROETHYLENE" = "TCE"
+    ),
+    pollutant_name = factor(
+      pollutant_name,
+      levels = c(
+        "Carbon tetrachloride",
+        "1,2-Dichloroethane",
+        "1,1-Dichloroethane",
+        "Methylene chloride",
+        "PCE",
+        "TCE"
+      )
+    )
+  )
 
+write.csv(
+  HQ_averages,
+  file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/HQ_averages.csv",
+  row.names = FALSE
+)
 
 # stacked bar plot for HQ_tot
-chlor_HQtot_bar = ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_tot, fill = pollutant_name)) +
+chlor_HQtot_bar <- ggplot(
+  HQ_averages,
+  aes(x = endpoint, y = avg_HQ_tot, fill = pollutant_name)
+) +
   geom_bar(stat = "identity") +
-  labs(
-    title = "Average HQ_tot by Endpoint and Pollutant",
-    x = "Endpoint",
-    y = "Average HQ_tot",
-    fill = "Pollutant"
+  geom_hline(
+    yintercept = 1,
+    linetype = "dotted",
+    linewidth = 0.8
   ) +
-  theme_minimal() +
+  scale_fill_okabe_ito() +
+  labs(
+    x = NULL,
+    y = "Average Hazard Quotient (HQ)",
+    fill = "Chemical"
+  ) +
+  theme_bw(base_size = 12) +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
   )
 
 chlor_HQtot_bar
 
-ggsave(filename = "bar_avgHQtot_endpoints.png", device = "png", plot = chlor_HQtot_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/", width = 7, height = 5)
+ggsave(
+  "bar_avgHQtot_endpoints.png",
+  chlor_HQtot_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/",
+  width = 7,
+  height = 5,
+  dpi = 600
+)
 
 # stacked bar plot for HQ_pt
-chlor_HQpt_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_pt, fill = pollutant_name)) +
+chlor_HQpt_bar <- ggplot(
+  HQ_averages,
+  aes(x = endpoint, y = avg_HQ_pt, fill = pollutant_name)
+) +
   geom_bar(stat = "identity") +
-  labs(
-    title = "Average HQ_pt by Endpoint and Pollutant",
-    x = "Endpoint",
-    y = "Average HQ_pt",
-    fill = "Pollutant"
+  geom_hline(
+    yintercept = 1,
+    linetype = "dotted",
+    linewidth = 0.8
   ) +
-  theme_minimal() +
+  scale_fill_okabe_ito() +
+  labs(
+    x = NULL,
+    y = "Average Hazard Quotient (HQ)",
+    fill = "Chemical"
+  ) +
+  theme_bw(base_size = 12) +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
   )
 
 chlor_HQpt_bar
 
-ggsave(filename = "bar_avgHQpt_endpoints.png", device = "png", plot = chlor_HQpt_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/", width = 7, height = 5)
+ggsave(
+  "bar_avgHQpt_endpoints.png",
+  chlor_HQpt_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/",
+  width = 7,
+  height = 5,
+  dpi = 600
+)
 
-# stacked bar plot for HQ_other
-chlor_HQother_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_other, fill = pollutant_name)) +
-  geom_bar(stat = "identity") +
-  labs(
-    title = "Average HQ_other by Endpoint and Pollutant",
-    x = "Endpoint",
-    y = "Average HQ_other",
-    fill = "Pollutant"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-
-chlor_HQother_bar
-
-ggsave(filename = "bar_avgHQother_endpoints.png", device = "png", plot = chlor_HQother_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI1/", width = 7, height = 5)
-
+# save for downstream paneling
+chlor_HQpt_bar_HI1  <- chlor_HQpt_bar
+chlor_HQtot_bar_HI1 <- chlor_HQtot_bar
 ```
 
 
@@ -850,68 +900,175 @@ chlor_exceedances_with_HQs <- chlor_exceedances %>%
     by = c("block", "endpoint")
   )
 
-# filter for blocks where HIs are greater than 0.1 but HQs are not
+# keep only block/endpoint combinations where:
+#   HI_tot > 0.1
+#   AND every individual HQ_tot <= 0.1
+
 chlor_exceedances_HI_only <- chlor_exceedances_with_HQs %>%
   group_by(block, endpoint) %>%
   filter(
-    (any(HI_tot > 0.1) & all(is.na(HQ_tot) | HQ_tot <= 0.1)) |
-    (any(HI_pt > 0.1) & all(is.na(HQ_pt) | HQ_pt <= 0.1)) |
-    (any(HI_other > 0.1) & all(is.na(HQ_other) | HQ_other <= 0.1))
+    any(HI_tot > 0.1) &
+      all(is.na(HQ_tot) | HQ_tot <= 0.1)
   ) %>%
   mutate(
-    HI_exceeding_type = case_when(
-      HI_tot > 0.1 & (is.na(HQ_tot) | HQ_tot <= 0.1) ~ "HI_tot",
-      HI_pt  > 0.1 & (is.na(HQ_pt)  | HQ_pt  <= 0.1) ~ "HI_pt",
-      HI_other > 0.1 & (is.na(HQ_other) | HQ_other <= 0.1) ~ "HI_other",
-      TRUE ~ NA_character_
-    ),
-    max_HI = pmax(HI_tot, HI_pt, HI_other, na.rm = TRUE)
+    max_HI = max(HI_tot, na.rm = TRUE)
   ) %>%
   ungroup()
 
-# select top 10 blocks for each endpoint by max_HI
+# select top 10 blocks per endpoint by HI_tot
+
 top10_blocks_per_endpoint <- chlor_exceedances_HI_only %>%
   group_by(endpoint, block) %>%
-  summarize(max_HI_block = max(max_HI, na.rm = TRUE), .groups = "drop") %>%
+  summarise(
+    max_HI_block = max(max_HI, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
   group_by(endpoint) %>%
-  arrange(desc(max_HI_block)) %>%
+  arrange(desc(max_HI_block), .by_group = TRUE) %>%
   slice_head(n = 10) %>%
   ungroup()
 
+# keep only the selected endpoint-block combinations
+
 chlor_exceedances_HI_only_top10 <- chlor_exceedances_HI_only %>%
-  filter(block %in% top10_blocks_per_endpoint$block)
+  inner_join(
+    top10_blocks_per_endpoint %>%
+      select(endpoint, block),
+    by = c("endpoint", "block")
+  )
 
-write.csv(chlor_exceedances_HI_only_top10, 
-          file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/block_combinedexceedances_top10_per_endpoint.csv")
+# create generic block labels within each endpoint
 
-# create generic block labels within each endpoint for readability
 chlor_exceedances_HI_only_top10 <- chlor_exceedances_HI_only_top10 %>%
   group_by(endpoint) %>%
-  mutate(block_label = paste0("Block ", dense_rank(desc(max_HI)))) %>%
+  mutate(
+    block_label = paste0("Block ", dense_rank(desc(max_HI)))
+  ) %>%
   ungroup()
 
-# graph 
-chlor_HQblocks_bar <- ggplot(chlor_exceedances_HI_only_top10, 
-                              aes(x = block_label, y = HQ_tot, fill = pollutant_name)) +
-  geom_bar(stat = "identity") +
+# clean chemical names for legend and fix order for consistent colors
+
+chlor_exceedances_HI_only_top10 <- chlor_exceedances_HI_only_top10 %>%
+  mutate(
+    pollutant_name = dplyr::case_match(
+      pollutant_name,
+      "CARBON TETRACHLORIDE" ~ "Carbon tetrachloride",
+      "ETHYLENE DICHLORIDE (1,2-DICHLOROETHANE)" ~ "1,2-Dichloroethane",
+      "ETHYLIDENE DICHLORIDE (1,1-DICHLOROETHANE)" ~ "1,1-Dichloroethane",
+      "METHYLENE CHLORIDE" ~ "Methylene chloride",
+      "TETRACHLOROETHYLENE" ~ "PCE",
+      "TRICHLOROETHYLENE" ~ "TCE",
+      .default = pollutant_name
+    ),
+    pollutant_name = factor(
+      pollutant_name,
+      levels = c(
+        "Carbon tetrachloride",
+        "1,2-Dichloroethane",
+        "1,1-Dichloroethane",
+        "Methylene chloride",
+        "PCE",
+        "TCE"
+      )
+    )
+  )
+
+write.csv(
+  chlor_exceedances_HI_only_top10,
+  "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/block_combinedexceedances_top10_per_endpoint.csv",
+  row.names = FALSE
+)
+
+# graph
+
+chlor_HQblocks_bar <- ggplot(
+  chlor_exceedances_HI_only_top10,
+  aes(
+    x = block_label,
+    y = HQ_tot,
+    fill = pollutant_name
+  )
+) +
+  geom_bar(stat = "identity", color = NA) +
   facet_wrap(~ endpoint, scales = "free_x") +
+  scale_fill_manual(
+    values = ggokabeito::palette_okabe_ito()
+  ) +
+  geom_hline(
+    yintercept = 0.1,
+    linetype = "dotted",
+    linewidth = 0.8
+  ) +
   labs(
-    title = "HQ_tot by Pollutant and Top 10 Blocks per Endpoint (HI > 0.1)",
-    x = "Block (generic labels)",
-    y = "HQ_tot",
-    fill = "Pollutant"
+    x = "Blocks",
+    y = "Hazard Quotient (HQ)",
+    fill = "Chemical"
   ) +
   theme_minimal() +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(size = 10, face = "bold")
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text = element_text(
+      size = 10,
+      face = "bold"
+    )
   )
 
 chlor_HQblocks_bar
 
-ggsave(filename = "bar_HQtot_blocks.png", device = "png", plot = chlor_HQblocks_bar, 
-       path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+ggsave(
+  filename = "bar_HQtot_blocks.png",
+  plot = chlor_HQblocks_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/",
+  width = 7,
+  height = 5,
+  dpi = 600
+)
 
+# save for paneling later
+
+saveRDS(
+  chlor_HQblocks_bar,
+  "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/plot_A.rds"
+)
+
+## troubleshooting (should return 0 rows, so we're good)
+
+n_HI_exceedances <- chlor_exceedances_HI_only_top10 %>%
+  group_by(block, endpoint) %>%
+  summarise(
+    max_single_HQ = max(HQ_tot, na.rm = TRUE),
+    HI_tot = max(HI_tot, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(max_single_HQ > 0.1)
+
+n_HI_exceedances
+
+# all HI exceedances = 6,597
+
+n_cumulative_only <- chlor_exceedances %>%
+  group_by(block, endpoint) %>%
+  summarise(
+    HI_tot = max(HI_tot, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(HI_tot > 0.1) %>%
+  nrow()
+
+n_cumulative_only
+
+# HI exceedances with no individual HQ exceedance = 556
+
+n_HI_only <- chlor_exceedances_HI_only %>%
+  distinct(block, endpoint) %>%
+  nrow()
+
+n_HI_only
+
+# percentage = 8.43%
+
+100 * n_HI_only / n_cumulative_only
 ```
 
 
@@ -926,40 +1083,120 @@ HQ_averages <- chlor_exceedances_with_HQs %>%
     avg_HQ_other = mean(HQ_other, na.rm = TRUE),
     n = n(),
     .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    pollutant_name = dplyr::case_match(
+      pollutant_name,
+      "CARBON TETRACHLORIDE" ~ "Carbon tetrachloride",
+      "ETHYLENE DICHLORIDE (1,2-DICHLOROETHANE)" ~ "1,2-Dichloroethane",
+      "ETHYLIDENE DICHLORIDE (1,1-DICHLOROETHANE)" ~ "1,1-Dichloroethane",
+      "METHYLENE CHLORIDE" ~ "Methylene chloride",
+      "TETRACHLOROETHYLENE" ~ "PCE",
+      "TRICHLOROETHYLENE" ~ "TCE",
+      .default = pollutant_name
+    ),
+    pollutant_name = factor(
+      pollutant_name,
+      levels = c(
+        "Carbon tetrachloride",
+        "1,2-Dichloroethane",
+        "1,1-Dichloroethane",
+        "Methylene chloride",
+        "PCE",
+        "TCE"
+      )
+    )
   )
 
-write.csv(HQ_averages, file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/HQ_averages.csv")
+write.csv(
+  HQ_averages,
+  file = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/HQ_averages.csv",
+  row.names = FALSE
+)
 
-# stacked bar plot for HQ_bar
-chlor_HQtot_bar = ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_tot, fill = pollutant_name)) +
+# -------------------------
+# HQ_tot plot
+# -------------------------
+
+chlor_HQtot_bar <- ggplot(
+  HQ_averages,
+  aes(x = endpoint, y = avg_HQ_tot, fill = pollutant_name)
+) +
   geom_bar(stat = "identity") +
-  labs(title = "Average HQ_tot by Endpoint and Pollutant", x = "Endpoint", y = "Average HQ_tot", fill = "Pollutant") +
-  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  geom_hline(
+    yintercept = 0.1,
+    linetype = "dotted",
+    linewidth = 0.8
+  ) +
+  scale_fill_okabe_ito() +
+  labs(
+    x = "Endpoint",
+    y = "Average Hazard Quotient (HQ)",
+    fill = "Chemical"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.direction = "horizontal"
+  )
 
 chlor_HQtot_bar
 
-ggsave(filename = "bar_avgHQtot_endpoints.png", device = "png", plot = chlor_HQtot_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+ggsave(
+  filename = "bar_avgHQtot_endpoints.png",
+  plot = chlor_HQtot_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/",
+  width = 7,
+  height = 5,
+  dpi = 600
+)
 
-# stacked bar plot for HQ_pt
-chlor_HQpt_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_pt, fill = pollutant_name)) +
+# -------------------------
+# HQ_pt plot
+# -------------------------
+
+chlor_HQpt_bar <- ggplot(
+  HQ_averages,
+  aes(x = endpoint, y = avg_HQ_pt, fill = pollutant_name)
+) +
   geom_bar(stat = "identity") +
-  labs(title = "Average HQ_pt by Endpoint and Pollutant", x = "Endpoint", y = "Average HQ_pt", fill = "Pollutant") +
-  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  geom_hline(
+    yintercept = 0.1,
+    linetype = "dotted",
+    linewidth = 0.8
+  ) +
+  scale_fill_okabe_ito() +
+  labs(
+    x = "Endpoint",
+    y = "Average Hazard Quotient (HQ)",
+    fill = "Chemical"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
 
 chlor_HQpt_bar
 
-ggsave(filename = "bar_avgHQpt_endpoints.png", device = "png", plot = chlor_HQpt_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
+ggsave(
+  filename = "bar_avgHQpt_endpoints.png",
+  plot = chlor_HQpt_bar,
+  path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/",
+  width = 7,
+  height = 5,
+  dpi = 600
+)
 
-# stacked bar plot for HQ_other
-chlor_HQother_bar <- ggplot(HQ_averages, aes(x = endpoint, y = avg_HQ_other, fill = pollutant_name)) +
-  geom_bar(stat = "identity") +
-  labs(title = "Average HQ_other by Endpoint and Pollutant", x = "Endpoint", y = "Average HQ_other", fill = "Pollutant") +
-  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# -------------------------
+# save for downstream paneling
+# -------------------------
 
-chlor_HQother_bar
-
-ggsave(filename = "bar_avgHQother_endpoints.png", device = "png", plot = chlor_HQother_bar, path = "~/TSCA/CRA/metdb_tsca/output/chlor/Air/HI01/", width = 7, height = 5)
-
+chlor_HQpt_bar_HI01  <- chlor_HQpt_bar
+chlor_HQtot_bar_HI01 <- chlor_HQtot_bar
 ```
 
 
@@ -1012,6 +1249,119 @@ write.csv(
   row.names = FALSE
 )
 
+```
+
+
+
+
+
+################## COMBINING GRAPHS FOR PUBLICATION ###########################
+
+
+#4 panel figure for average HIs per endpoint colored by chemical for A) blocks exceeding HI of 1, point sources; B) blocks exceeding HI of 1; total sources; C) blocks exceeding HI of 0.1, point sources; D) blocks exceeding HI of 0.1, total sources
+```{r}
+#--------------------------------------------------
+# Extract legend from Panel D (HI01 HQ_tot)
+#--------------------------------------------------
+
+legend <- get_legend(
+  chlor_HQtot_bar_HI01 +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box = "horizontal"
+    )
+)
+
+#--------------------------------------------------
+# Remove legends from all panels
+#--------------------------------------------------
+
+pA <- chlor_HQpt_bar_HI1 +
+  theme(legend.position = "none")
+
+pB <- chlor_HQtot_bar_HI1 +
+  theme(legend.position = "none")
+
+pC <- chlor_HQpt_bar_HI01 +
+  theme(legend.position = "none")
+
+pD <- chlor_HQtot_bar_HI01 +
+  theme(legend.position = "none")
+
+#--------------------------------------------------
+# Top row (HI1)
+#--------------------------------------------------
+
+top_row <- plot_grid(
+  pA,
+  pB,
+  labels = c("A", "B"),
+  label_size = 18,
+  label_fontface = "bold",
+  nrow = 1,
+  align = "hv"
+)
+
+#--------------------------------------------------
+# Bottom row (HI01)
+#--------------------------------------------------
+
+bottom_row <- plot_grid(
+  pC,
+  pD,
+  labels = c("C", "D"),
+  label_size = 18,
+  label_fontface = "bold",
+  nrow = 1,
+  align = "hv"
+)
+
+#--------------------------------------------------
+# Combine rows and legend
+#--------------------------------------------------
+
+final_fig <- plot_grid(
+  top_row,
+  bottom_row,
+  legend,
+  ncol = 1,
+  rel_heights = c(1, 1, 0.15)
+)
+
+#--------------------------------------------------
+# Save outputs
+#--------------------------------------------------
+
+outdir <- "~/TSCA/CRA/metdb_tsca/output/chlor/Air"
+
+ggsave(
+  filename = file.path(outdir,
+                       "avgHI_combined_thresholds_byendpoint.png"),
+  plot = final_fig,
+  width = 12,
+  height = 10,
+  dpi = 600
+)
+
+ggsave(
+  filename = file.path(outdir,
+                       "avgHI_combined_thresholds_byendpoint.tiff"),
+  plot = final_fig,
+  width = 12,
+  height = 10,
+  dpi = 600,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(outdir,
+                       "avgHI_combined_thresholds_byendpoint.pdf"),
+  plot = final_fig,
+  width = 12,
+  height = 10,
+  device = cairo_pdf
+)
 ```
 
 
