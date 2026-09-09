@@ -1,0 +1,2761 @@
+---
+title: "Chlor Visualization for MS publication - paneled plots"
+output: html_document
+date: "2026-07-01"
+---
+
+
+# Load libraries
+```{r}
+library(bigrquery)
+library(DBI)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggbeeswarm)
+library(stringr)
+```
+
+
+# Connect to BigQuery
+```{r}
+bq_auth(
+  email = NA
+)
+
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "edf-aq-data",
+  dataset = "airtoxscreen"
+)
+
+project_id <- "edf-aq-data"
+```
+
+
+#important sensitivity analysis on combination statistics: 15,166 blocks are included in the PWS dataset but not the ATS dataset. need to check the population from the Census data on these blocks to see if they weren't included in ATS because ATS doesn't model exposures for blocks with population = 0. It makes sense otherwise that there are lots of blocks that have ATS data and not PWS data because millions are not on PWS.
+```{r}
+# Step 1: Query unmatched PWS blocks from BigQuery
+SQL <- "
+SELECT DISTINCT
+  LPAD(CAST(pws.geoid20 AS STRING), 15, '0') AS geoid20
+FROM `edf-aq-data.TSCA.chlor_PWS_HQs_half` AS pws
+WHERE LPAD(CAST(pws.geoid20 AS STRING), 15, '0') NOT IN (
+  SELECT DISTINCT LPAD(CAST(block AS STRING), 15, '0')
+  FROM `edf-aq-data.TSCA.chlor_ATS_HIs`
+)
+"
+unmatched_PWS <- dbGetQuery(con, SQL)
+
+# Step 2: Get state FIPS codes from unmatched blocks
+unmatched_PWS <- unmatched_PWS %>%
+  mutate(state_fips = substr(geoid20, 1, 2))
+
+states_needed <- unique(unmatched_PWS$state_fips)
+
+# Step 4: Loop through those states to pull 2020 block-level population
+pop_blocks_all <- data.frame()
+
+for (fips in states_needed) {
+  message("Getting population for state FIPS: ", fips)
+  
+  tryCatch({
+    state_blocks <- get_decennial(
+      geography = "block",
+      variables = "P1_001N",  # total population 2020 PL data
+      year = 2020,
+      state = fips,
+      geometry = FALSE,
+      output = "wide",
+      dataset = "pl"
+    )
+    
+    pop_blocks_all <- bind_rows(pop_blocks_all, state_blocks)
+  }, error = function(e) {
+    message("Error for state ", fips, ": ", e$message)
+  })
+}
+
+# Step 5: Join population to unmatched PWS blocks
+pws_blocks_with_pop <- unmatched_PWS %>%
+  left_join(pop_blocks_all, by = c("geoid20" = "GEOID"))
+
+# Step 6: Summarize
+summary_table <- pws_blocks_with_pop %>%
+  mutate(pop = P1_001N) %>%
+  summarise(
+    total_blocks = n(),
+    blocks_with_population = sum(!is.na(pop) & pop > 0),
+    blocks_with_zero_or_na = sum(is.na(pop) | pop == 0),
+    total_population = sum(pop, na.rm = TRUE)
+  )
+
+# Step 7: View results
+print(summary_table)
+
+# all 15,166 blocks included in PWS and not in ATS have a population of zero or NA in the 2020 Census - this is great news, which means that the joining of the ATS and PWS HIs are joined properly and there are no issues with mismatching geoids, for example
+```
+
+
+
+# Define output directory
+```{r}
+output_dir <- "~/TSCA/CRA/metdb_tsca/output/Chlor/"
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+
+# Define endpoint and scenario settings
+```{r}
+
+selected_endpoints <- c(
+  "developmental",
+  "renal"
+)
+
+endpoint_levels <- c(
+  "Developmental",
+  "Renal"
+)
+
+four_scenario_levels <- c(
+  "Point air",
+  "Total air",
+  "Total air + child drinking water",
+  "Cumulative HI"
+)
+
+four_scenario_labels <- c(
+  "Point air" =
+    "Point air",
+
+  "Total air" =
+    "Total air",
+
+  "Total air + child drinking water" =
+    "Total air + Ingestion (Child)",
+
+  "Cumulative HI" =
+    "Cumulative HI (Child)"
+)
+```
+
+
+# Distribution-summary function
+```{r}
+summarise_distribution <- function(
+  data,
+  value,
+  ...
+) {
+
+  data %>%
+    group_by(...) %>%
+    summarise(
+      sample_size = sum(
+        !is.na({{ value }})
+      ),
+
+      mean = mean(
+        {{ value }},
+        na.rm = TRUE
+      ),
+
+      median = median(
+        {{ value }},
+        na.rm = TRUE
+      ),
+
+      minimum = min(
+        {{ value }},
+        na.rm = TRUE
+      ),
+
+      maximum = max(
+        {{ value }},
+        na.rm = TRUE
+      ),
+
+      sd = sd(
+        {{ value }},
+        na.rm = TRUE
+      ),
+
+      se = sd(
+        {{ value }},
+        na.rm = TRUE
+      ) /
+        sqrt(
+          sum(
+            !is.na({{ value }})
+          )
+        ),
+
+      .groups = "drop"
+    )
+}
+```
+
+
+#pull TCE HQ data
+```{r}
+# ============================================================
+# 1. Pull TCE air HQs
+#
+# GEOIDs are standardized to 15 characters before joining.
+# Only the two publication endpoints are downloaded.
+# ============================================================
+
+SQL_tce_air_hq <- "
+SELECT
+  LPAD(
+    CAST(h.block AS STRING),
+    15,
+    '0'
+  ) AS geoid20,
+
+  h.pollutant_name,
+  LOWER(TRIM(h.endpoint)) AS endpoint,
+  h.HQ_pt,
+  h.HQ_tot
+
+FROM
+  `edf-aq-data.TSCA.chlor_ATS_HQs` h
+
+JOIN (
+  SELECT DISTINCT
+    GEOID
+
+  FROM
+    `edf-aq-data.TSCA.filtblocks_chlor`
+) f
+
+  ON LPAD(
+    CAST(h.block AS STRING),
+    15,
+    '0'
+  ) = f.GEOID
+
+WHERE
+  UPPER(TRIM(h.pollutant_name)) =
+    'TRICHLOROETHYLENE'
+
+  AND LOWER(TRIM(h.endpoint)) IN (
+    'developmental',
+    'renal'
+  )
+"
+
+
+tce_air_hq <- bq_project_query(
+  project_id,
+  SQL_tce_air_hq
+) %>%
+  bq_table_download() %>%
+  transmute(
+    geoid20 = as.character(
+      geoid20
+    ),
+
+    endpoint = str_to_lower(
+      str_trim(endpoint)
+    ),
+
+    HQ_pt = as.numeric(
+      HQ_pt
+    ),
+
+    HQ_tot = as.numeric(
+      HQ_tot
+    )
+  ) %>%
+  filter(
+    !is.na(geoid20),
+    !is.na(endpoint),
+    endpoint %in% selected_endpoints
+  )
+
+
+# ============================================================
+# 2. Check TCE air HQ uniqueness
+#
+# Expected unique unit:
+# geoid20 + endpoint
+# ============================================================
+
+tce_air_hq_duplicate_check <-
+  tce_air_hq %>%
+  count(
+    geoid20,
+    endpoint,
+    name = "n_records"
+  ) %>%
+  filter(
+    n_records > 1
+  )
+
+tce_air_hq_duplicate_check
+
+
+# ============================================================
+# 3. Pull TCE child drinking-water HQs
+#
+# The PWS table uses the chemical code "tce".
+# ============================================================
+
+SQL_tce_water_hq <- "
+SELECT
+  LPAD(
+    CAST(p.geoid20 AS STRING),
+    15,
+    '0'
+  ) AS geoid20,
+
+  LOWER(TRIM(p.endpoint)) AS endpoint,
+  p.pop,
+  p.chem,
+  p.hq AS HQ_water
+
+FROM
+  `edf-aq-data.TSCA.chlor_PWS_HQs_half` p
+
+JOIN (
+  SELECT DISTINCT
+    GEOID
+
+  FROM
+    `edf-aq-data.TSCA.filtblocks_chlor`
+) f
+
+  ON LPAD(
+    CAST(p.geoid20 AS STRING),
+    15,
+    '0'
+  ) = f.GEOID
+
+WHERE
+  LOWER(TRIM(p.chem)) = 'tce'
+
+  AND LOWER(TRIM(p.pop)) = 'ch'
+
+  AND LOWER(TRIM(p.endpoint)) IN (
+    'developmental',
+    'renal'
+  )
+"
+
+
+tce_water_hq <- bq_project_query(
+  project_id,
+  SQL_tce_water_hq
+) %>%
+  bq_table_download() %>%
+  transmute(
+    geoid20 = as.character(
+      geoid20
+    ),
+
+    endpoint = str_to_lower(
+      str_trim(endpoint)
+    ),
+
+    HQ_water = as.numeric(
+      HQ_water
+    )
+  ) %>%
+  filter(
+    !is.na(geoid20),
+    !is.na(endpoint),
+    endpoint %in% selected_endpoints
+  )
+
+
+# ============================================================
+# 4. Check TCE water HQ uniqueness
+# ============================================================
+
+tce_water_hq_duplicate_check <-
+  tce_water_hq %>%
+  count(
+    geoid20,
+    endpoint,
+    name = "n_records"
+  ) %>%
+  filter(
+    n_records > 1
+  )
+
+tce_water_hq_duplicate_check
+
+
+# ============================================================
+# 5. Create TCE HQ data for the three HQ scenarios
+#
+# The inner join ensures that all three HQ scenarios initially
+# use block-endpoint combinations with both air and child
+# drinking-water HQ information.
+# ============================================================
+
+tce_combined_hq <- tce_air_hq %>%
+  inner_join(
+    tce_water_hq,
+    by = c(
+      "geoid20",
+      "endpoint"
+    )
+  ) %>%
+  mutate(
+    HQ_combined =
+      HQ_tot + HQ_water
+  )
+
+
+# ============================================================
+# 6. Check final combined TCE HQ uniqueness
+# ============================================================
+
+tce_combined_hq_duplicate_check <-
+  tce_combined_hq %>%
+  count(
+    geoid20,
+    endpoint,
+    name = "n_records"
+  ) %>%
+  filter(
+    n_records > 1
+  )
+
+tce_combined_hq_duplicate_check
+
+
+# ============================================================
+# 7. Convert TCE HQ data to three-scenario long format
+# ============================================================
+
+tce_hq_scenario_df <- tce_combined_hq %>%
+  transmute(
+    geoid20,
+    endpoint,
+
+    `Point air` =
+      HQ_pt,
+
+    `Total air` =
+      HQ_tot,
+
+    `Total air + child drinking water` =
+      HQ_combined
+  ) %>%
+  pivot_longer(
+    cols = c(
+      `Point air`,
+      `Total air`,
+      `Total air + child drinking water`
+    ),
+
+    names_to = "scenario",
+    values_to = "value"
+  ) %>%
+  filter(
+    !is.na(value)
+  ) %>%
+  mutate(
+    metric = "TCE HQ"
+  )
+
+
+# ============================================================
+# 8. Check resulting TCE scenario data
+# ============================================================
+
+tce_hq_scenario_df %>%
+  count(
+    endpoint,
+    scenario,
+    name = "n_records"
+  )
+
+
+tce_hq_scenario_df %>%
+  group_by(
+    endpoint,
+    scenario
+  ) %>%
+  summarise(
+    total_blocks = n_distinct(
+      geoid20
+    ),
+
+    .groups = "drop"
+  )
+
+```
+
+
+
+# Pull cumulative HIs
+```{r}
+# ============================================================
+# Pull cumulative HIs only for Developmental and Renal
+#
+# Population priority is handled in BigQuery:
+# 1. Use child ("ch") HI when available
+# 2. Otherwise use population-unspecified ("NA") HI
+#
+# Only one row per block-endpoint is downloaded.
+# ============================================================
+
+SQL_selected_endpoint_hi <- "
+WITH eligible_hi AS (
+
+  SELECT
+    h.geoid20,
+
+    LOWER(
+      TRIM(h.endpoint)
+    ) AS endpoint,
+
+    LOWER(
+      TRIM(h.pop)
+    ) AS pop,
+
+    h.HI_tot_comb,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        h.geoid20,
+        LOWER(TRIM(h.endpoint))
+
+      ORDER BY
+        CASE
+          WHEN LOWER(TRIM(h.pop)) = 'ch'
+            THEN 1
+
+          WHEN LOWER(TRIM(h.pop)) = 'na'
+            THEN 2
+
+          ELSE 3
+        END
+    ) AS population_rank
+
+  FROM
+    `edf-aq-data.TSCA.chlor_combined_HIs` h
+
+  JOIN (
+    SELECT DISTINCT
+      GEOID
+
+    FROM
+      `edf-aq-data.TSCA.filtblocks_chlor`
+  ) f
+
+    ON h.geoid20 = f.GEOID
+
+  WHERE
+    LOWER(TRIM(h.pop)) IN (
+      'ch',
+      'na'
+    )
+
+    AND LOWER(TRIM(h.endpoint)) IN (
+      'developmental',
+      'renal'
+    )
+
+    AND h.HI_tot_comb IS NOT NULL
+)
+
+SELECT
+  geoid20,
+  endpoint,
+  pop AS selected_population,
+  HI_tot_comb
+
+FROM
+  eligible_hi
+
+WHERE
+  population_rank = 1
+"
+
+
+selected_endpoint_hi_raw <- bq_project_query(
+  project_id,
+  SQL_selected_endpoint_hi
+) %>%
+  bq_table_download() %>%
+  transmute(
+    geoid20 = as.character(
+      geoid20
+    ),
+
+    endpoint = str_to_lower(
+      str_trim(endpoint)
+    ),
+
+    selected_population = str_to_lower(
+      str_trim(selected_population)
+    ),
+
+    HI_tot_comb = as.numeric(
+      HI_tot_comb
+    )
+  ) %>%
+  filter(
+    !is.na(geoid20),
+    !is.na(endpoint),
+    endpoint %in% selected_endpoints,
+    !is.na(HI_tot_comb)
+  )
+
+
+# ============================================================
+# Check that one selected HI exists per block-endpoint
+#
+# This should return zero rows.
+# ============================================================
+
+selected_endpoint_hi_duplicate_check <-
+  selected_endpoint_hi_raw %>%
+  count(
+    geoid20,
+    endpoint,
+    name = "n_records"
+  ) %>%
+  filter(
+    n_records > 1
+  )
+
+selected_endpoint_hi_duplicate_check
+
+
+# ============================================================
+# Report selected HI population sources
+# ============================================================
+
+selected_endpoint_hi_population_summary <-
+  selected_endpoint_hi_raw %>%
+  count(
+    selected_population,
+    name = "selected_block_endpoint_records"
+  )
+
+selected_endpoint_hi_population_summary
+
+
+# ============================================================
+# Check selected HI block counts by endpoint
+# ============================================================
+
+selected_endpoint_hi_block_summary <-
+  selected_endpoint_hi_raw %>%
+  group_by(
+    endpoint
+  ) %>%
+  summarise(
+    total_records = n(),
+
+    total_blocks = n_distinct(
+      geoid20
+    ),
+
+    .groups = "drop"
+  )
+
+selected_endpoint_hi_block_summary
+```
+
+
+
+#prepare data for figure
+```{r}
+
+# ============================================================
+# Prepare cumulative HI records for the final figure
+# ============================================================
+
+selected_endpoint_hi_df <- selected_endpoint_hi_raw %>%
+  transmute(
+    geoid20,
+    endpoint,
+    scenario = "Cumulative HI",
+    metric = "Cumulative HI",
+    value = HI_tot_comb
+  ) %>%
+  filter(
+    !is.na(geoid20),
+    !is.na(endpoint),
+    !is.na(value)
+  )
+
+
+# ============================================================
+# Combine TCE HQ and cumulative HI records
+#
+# This full dataset retains zeros and is used for tables.
+# ============================================================
+
+combined_endpoint_analysis_df <- bind_rows(
+  tce_hq_scenario_df,
+  selected_endpoint_hi_df
+) %>%
+  filter(
+    !is.na(geoid20),
+    !is.na(endpoint),
+    !is.na(scenario),
+    !is.na(metric),
+    !is.na(value)
+  ) %>%
+  mutate(
+    endpoint = str_to_title(
+      endpoint
+    ),
+
+    endpoint = factor(
+      endpoint,
+      levels = endpoint_levels
+    ),
+
+    scenario = factor(
+      scenario,
+      levels = four_scenario_levels
+    ),
+
+    metric = factor(
+      metric,
+      levels = c(
+        "TCE HQ",
+        "Cumulative HI"
+      )
+    )
+  )
+
+
+# ============================================================
+# Restrict to blocks present in both endpoints and all
+#     four scenarios
+#
+# Required combinations:
+# 2 endpoints x 4 scenarios = 8 combinations per block.
+# ============================================================
+
+required_endpoint_scenario_combinations <-
+  length(endpoint_levels) *
+  length(four_scenario_levels)
+
+
+common_analysis_blocks <-
+  combined_endpoint_analysis_df %>%
+  distinct(
+    geoid20,
+    endpoint,
+    scenario
+  ) %>%
+  count(
+    geoid20,
+    name = "n_endpoint_scenario_combinations"
+  ) %>%
+  filter(
+    n_endpoint_scenario_combinations ==
+      required_endpoint_scenario_combinations
+  ) %>%
+  select(
+    geoid20
+  )
+
+
+# Number of common blocks retained
+nrow(
+  common_analysis_blocks
+)
+
+
+combined_endpoint_analysis_df <-
+  combined_endpoint_analysis_df %>%
+  semi_join(
+    common_analysis_blocks,
+    by = "geoid20"
+  )
+
+
+# ============================================================
+# Final analytical duplicate check
+#
+# This should return zero rows.
+# ============================================================
+
+combined_endpoint_duplicate_check <-
+  combined_endpoint_analysis_df %>%
+  count(
+    geoid20,
+    endpoint,
+    scenario,
+    name = "n_records"
+  ) %>%
+  filter(
+    n_records > 1
+  )
+
+combined_endpoint_duplicate_check
+
+
+# ============================================================
+# Confirm identical sample sizes across all eight groups
+# ============================================================
+
+combined_endpoint_sample_sizes <-
+  combined_endpoint_analysis_df %>%
+  group_by(
+    endpoint,
+    scenario,
+    metric
+  ) %>%
+  summarise(
+    total_records = n(),
+
+    total_blocks = n_distinct(
+      geoid20
+    ),
+
+    .groups = "drop"
+  )
+
+combined_endpoint_sample_sizes
+
+
+stopifnot(
+  n_distinct(
+    combined_endpoint_sample_sizes$total_blocks
+  ) == 1
+)
+
+stopifnot(
+  all(
+    combined_endpoint_sample_sizes$total_records ==
+      combined_endpoint_sample_sizes$total_blocks
+  )
+)
+
+
+# ============================================================
+# Create positive-value-only plot dataset
+#
+# Zero values remain in combined_endpoint_analysis_df for
+# summary tables and denominator calculations.
+# ============================================================
+
+combined_endpoint_plot_df <-
+  combined_endpoint_analysis_df %>%
+  filter(
+    value > 0
+  )
+
+
+# ============================================================
+# Check zero values omitted from the log-scale figure
+# ============================================================
+
+combined_endpoint_zero_summary <-
+  combined_endpoint_analysis_df %>%
+  group_by(
+    endpoint,
+    scenario
+  ) %>%
+  summarise(
+    total_blocks = n_distinct(
+      geoid20
+    ),
+
+    zero_value_blocks = n_distinct(
+      geoid20[
+        value == 0
+      ]
+    ),
+
+    positive_value_blocks = n_distinct(
+      geoid20[
+        value > 0
+      ]
+    ),
+
+    .groups = "drop"
+  )
+
+combined_endpoint_zero_summary
+
+
+# ============================================================
+# Create distribution summary table for figure data
+#
+# Uses the full common-block dataset, including zero values.
+# ============================================================
+
+combined_endpoint_distribution_summary <-
+  summarise_distribution(
+    data = combined_endpoint_analysis_df,
+    value = value,
+    endpoint,
+    scenario,
+    metric
+  ) %>%
+  mutate(
+    endpoint = as.character(
+      endpoint
+    ),
+
+    scenario = as.character(
+      scenario
+    ),
+
+    metric = as.character(
+      metric
+    )
+  ) %>%
+  arrange(
+    factor(
+      endpoint,
+      levels = endpoint_levels
+    ),
+
+    factor(
+      scenario,
+      levels = four_scenario_levels
+    )
+  ) %>%
+  select(
+    endpoint,
+    scenario,
+    metric,
+    sample_size,
+    mean,
+    median,
+    minimum,
+    maximum,
+    sd,
+    se
+  )
+
+
+combined_endpoint_distribution_summary
+
+
+write.csv(
+  combined_endpoint_distribution_summary,
+  file = file.path(
+    output_dir,
+    paste0(
+      "chlor_TCE_developmental_renal_",
+      "distribution_summary.csv"
+    )
+  ),
+  row.names = FALSE
+)
+```
+
+
+
+
+#plot figure
+```{r}
+# ============================================================
+# Determine log-scale range
+# ============================================================
+
+combined_log_lower_exponent <- floor(
+  log10(
+    min(
+      combined_endpoint_plot_df$value,
+      na.rm = TRUE
+    )
+  )
+)
+
+combined_log_upper_exponent <- ceiling(
+  log10(
+    max(
+      combined_endpoint_plot_df$value,
+      na.rm = TRUE
+    )
+  )
+)
+
+
+combined_log_major_breaks <- 10^seq(
+  combined_log_lower_exponent,
+  combined_log_upper_exponent,
+  by = 1
+)
+
+
+# ============================================================
+# Define log-axis labels
+# ============================================================
+
+combined_log_major_labels <- function(x) {
+
+  ifelse(
+    dplyr::near(
+      x,
+      0.1
+    ),
+    "0.1",
+
+    ifelse(
+      dplyr::near(
+        x,
+        1
+      ),
+      "1",
+
+      format(
+        x,
+        scientific = TRUE,
+        trim = TRUE,
+        digits = 1
+      )
+    )
+  )
+}
+
+
+# ============================================================
+# Create final TCE publication figure
+# ============================================================
+
+tce_combined_endpoints_beeswarm_log <- ggplot(
+  combined_endpoint_plot_df,
+  aes(
+    x = scenario,
+    y = value,
+    color = endpoint
+  )
+) +
+
+  geom_quasirandom(
+    aes(
+      group = interaction(
+        scenario,
+        endpoint
+      )
+    ),
+    dodge.width = 0.65,
+    width = 0.18,
+    alpha = 0.35,
+    size = 0.4
+  ) +
+
+  geom_hline(
+    yintercept = c(
+      0.1,
+      1
+    ),
+    linetype = "dotted",
+    linewidth = 0.8,
+    color = "grey40"
+  ) +
+
+  scale_y_log10(
+    breaks = combined_log_major_breaks,
+    minor_breaks = NULL,
+    labels = combined_log_major_labels,
+    expand = expansion(
+      mult = c(
+        0.03,
+        0.05
+      )
+    )
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Developmental" = "#0072B2",
+      "Renal" = "#D55E00"
+    ),
+    labels = c(
+      "Developmental" = "Developmental (most sensitive)",
+      "Renal" = "Renal"
+    ),
+    guide = guide_legend(
+      override.aes = list(
+        alpha = 1,
+        size = 3
+      )
+    )
+  ) +
+
+  scale_x_discrete(
+    labels = four_scenario_labels
+  ) +
+
+  labs(
+    x = NULL,
+    y = "HQ or HI (log scale)",
+    color = "Endpoint"
+  ) +
+
+  theme_bw() +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1
+    ),
+
+    panel.grid.major.x =
+      element_blank(),
+
+    panel.grid.minor =
+      element_blank(),
+
+    panel.grid.major.y =
+      element_line(
+        color = "grey85",
+        linewidth = 0.4
+      ),
+
+    legend.position = "bottom"
+  )
+
+
+tce_combined_endpoints_beeswarm_log
+
+
+# ============================================================
+# Save final figure
+# ============================================================
+
+ggsave(
+  filename = paste0(
+    "chlor_TCE_developmental_renal_",
+    "aggregate_cumulative_log.png"
+  ),
+  plot = tce_combined_endpoints_beeswarm_log,
+  path = output_dir,
+  width = 8,
+  height = 5.5,
+  dpi = 600
+)
+```
+
+
+
+#create table for block threshold numbers/percentages that goes with the figure
+```{r}
+
+# ============================================================
+# Create raw eight-row threshold table
+#
+# Thresholds:
+# value >= 0.1
+# value >= 1
+# ============================================================
+
+combined_endpoint_exceedance_table_raw <-
+  combined_endpoint_analysis_df %>%
+  group_by(
+    endpoint,
+    scenario,
+    metric
+  ) %>%
+  summarise(
+    total_blocks = n_distinct(
+      geoid20
+    ),
+
+    blocks_ge_0_1 = n_distinct(
+      geoid20[
+        value >= 0.1
+      ]
+    ),
+
+    percent_ge_0_1 =
+      100 *
+      blocks_ge_0_1 /
+      total_blocks,
+
+    blocks_ge_1 = n_distinct(
+      geoid20[
+        value >= 1
+      ]
+    ),
+
+    percent_ge_1 =
+      100 *
+      blocks_ge_1 /
+      total_blocks,
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    endpoint = as.character(
+      endpoint
+    ),
+
+    scenario = as.character(
+      scenario
+    ),
+
+    metric = as.character(
+      metric
+    )
+  ) %>%
+  arrange(
+    factor(
+      endpoint,
+      levels = endpoint_levels
+    ),
+
+    factor(
+      scenario,
+      levels = four_scenario_levels
+    )
+  )
+
+
+combined_endpoint_exceedance_table_raw
+
+
+stopifnot(
+  nrow(
+    combined_endpoint_exceedance_table_raw
+  ) == 8
+)
+
+
+combined_endpoint_exceedance_validation <-
+  combined_endpoint_exceedance_table_raw %>%
+  summarise(
+    any_ge_0_1_above_total =
+      any(
+        blocks_ge_0_1 >
+          total_blocks
+      ),
+
+    any_ge_1_above_ge_0_1 =
+      any(
+        blocks_ge_1 >
+          blocks_ge_0_1
+      ),
+
+    any_percent_ge_0_1_above_100 =
+      any(
+        percent_ge_0_1 >
+          100
+      ),
+
+    any_percent_ge_1_above_100 =
+      any(
+        percent_ge_1 >
+          100
+      )
+  )
+
+combined_endpoint_exceedance_validation
+
+
+# ============================================================
+# Format eight-row threshold table
+# ============================================================
+
+combined_endpoint_exceedance_table <-
+  combined_endpoint_exceedance_table_raw %>%
+  mutate(
+    total_blocks_formatted = format(
+      total_blocks,
+      big.mark = ",",
+      scientific = FALSE,
+      trim = TRUE
+    ),
+
+    blocks_ge_0_1_n_percent = paste0(
+      format(
+        blocks_ge_0_1,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+      " (",
+      formatC(
+        percent_ge_0_1,
+        format = "f",
+        digits = 2
+      ),
+      "%)"
+    ),
+
+    blocks_ge_1_n_percent = paste0(
+      format(
+        blocks_ge_1,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+      " (",
+      formatC(
+        percent_ge_1,
+        format = "f",
+        digits = 2
+      ),
+      "%)"
+    )
+  ) %>%
+  transmute(
+    Endpoint = endpoint,
+    Scenario = scenario,
+    Metric = metric,
+
+    `Total blocks` =
+      total_blocks_formatted,
+
+    `Blocks >= 0.1, n (%)` =
+      blocks_ge_0_1_n_percent,
+
+    `Blocks >= 1, n (%)` =
+      blocks_ge_1_n_percent
+  )
+
+
+combined_endpoint_exceedance_table
+
+
+write.csv(
+  combined_endpoint_exceedance_table,
+  file = file.path(
+    output_dir,
+    paste0(
+      "chlor_TCE_developmental_renal_",
+      "block_threshold_table.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  combined_endpoint_exceedance_table_raw,
+  file = file.path(
+    output_dir,
+    paste0(
+      "chlor_TCE_developmental_renal_",
+      "block_threshold_table_raw.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+```
+
+
+
+#for supplemental: block exceedance numbers/percentages for HIs for each endpoint
+```{r}
+
+# ============================================================
+# Calculate all-endpoint threshold results in BigQuery
+#
+# Population priority:
+# 1. Child HI
+# 2. Air-only/NA HI if child is unavailable
+# ============================================================
+
+SQL_all_endpoint_hi_thresholds <- "
+WITH eligible_hi AS (
+
+  SELECT
+    h.geoid20,
+
+    LOWER(
+      TRIM(h.endpoint)
+    ) AS endpoint,
+
+    LOWER(
+      TRIM(h.pop)
+    ) AS pop,
+
+    h.HI_tot_comb,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        h.geoid20,
+        LOWER(TRIM(h.endpoint))
+
+      ORDER BY
+        CASE
+          WHEN LOWER(TRIM(h.pop)) = 'ch'
+            THEN 1
+
+          WHEN LOWER(TRIM(h.pop)) = 'na'
+            THEN 2
+
+          ELSE 3
+        END
+    ) AS population_rank
+
+  FROM
+    `edf-aq-data.TSCA.chlor_combined_HIs` h
+
+  JOIN (
+    SELECT DISTINCT
+      GEOID
+
+    FROM
+      `edf-aq-data.TSCA.filtblocks_chlor`
+  ) f
+
+    ON h.geoid20 = f.GEOID
+
+  WHERE
+    LOWER(TRIM(h.pop)) IN (
+      'ch',
+      'na'
+    )
+
+    AND h.endpoint IS NOT NULL
+    AND h.HI_tot_comb IS NOT NULL
+),
+
+selected_hi AS (
+
+  SELECT
+    geoid20,
+    endpoint,
+    HI_tot_comb
+
+  FROM
+    eligible_hi
+
+  WHERE
+    population_rank = 1
+)
+
+SELECT
+  endpoint,
+
+  COUNT(
+    DISTINCT geoid20
+  ) AS total_blocks,
+
+  COUNT(
+    DISTINCT IF(
+      HI_tot_comb >= 0.1,
+      geoid20,
+      NULL
+    )
+  ) AS blocks_ge_0_1,
+
+  SAFE_MULTIPLY(
+    SAFE_DIVIDE(
+      COUNT(
+        DISTINCT IF(
+          HI_tot_comb >= 0.1,
+          geoid20,
+          NULL
+        )
+      ),
+
+      COUNT(
+        DISTINCT geoid20
+      )
+    ),
+
+    100
+  ) AS percent_ge_0_1,
+
+  COUNT(
+    DISTINCT IF(
+      HI_tot_comb >= 1,
+      geoid20,
+      NULL
+    )
+  ) AS blocks_ge_1,
+
+  SAFE_MULTIPLY(
+    SAFE_DIVIDE(
+      COUNT(
+        DISTINCT IF(
+          HI_tot_comb >= 1,
+          geoid20,
+          NULL
+        )
+      ),
+
+      COUNT(
+        DISTINCT geoid20
+      )
+    ),
+
+    100
+  ) AS percent_ge_1
+
+FROM
+  selected_hi
+
+GROUP BY
+  endpoint
+
+ORDER BY
+  endpoint
+"
+
+
+cumulative_hi_threshold_table_raw <- bq_project_query(
+  project_id,
+  SQL_all_endpoint_hi_thresholds
+) %>%
+  bq_table_download() %>%
+  transmute(
+    endpoint = str_to_title(
+      endpoint
+    ),
+
+    total_blocks = as.numeric(
+      total_blocks
+    ),
+
+    blocks_ge_0_1 = as.numeric(
+      blocks_ge_0_1
+    ),
+
+    percent_ge_0_1 = as.numeric(
+      percent_ge_0_1
+    ),
+
+    blocks_ge_1 = as.numeric(
+      blocks_ge_1
+    ),
+
+    percent_ge_1 = as.numeric(
+      percent_ge_1
+    )
+  ) %>%
+  arrange(
+    endpoint
+  )
+
+
+cumulative_hi_threshold_table_raw
+
+
+cumulative_hi_threshold_validation <-
+  cumulative_hi_threshold_table_raw %>%
+  summarise(
+    any_ge_0_1_above_total =
+      any(
+        blocks_ge_0_1 >
+          total_blocks
+      ),
+
+    any_ge_1_above_ge_0_1 =
+      any(
+        blocks_ge_1 >
+          blocks_ge_0_1
+      ),
+
+    any_percent_ge_0_1_above_100 =
+      any(
+        percent_ge_0_1 >
+          100
+      ),
+
+    any_percent_ge_1_above_100 =
+      any(
+        percent_ge_1 >
+          100
+      )
+  )
+
+cumulative_hi_threshold_validation
+
+
+# ============================================================
+# Format all-endpoint threshold table
+# ============================================================
+
+cumulative_hi_threshold_table <-
+  cumulative_hi_threshold_table_raw %>%
+  mutate(
+    total_blocks_formatted = format(
+      total_blocks,
+      big.mark = ",",
+      scientific = FALSE,
+      trim = TRUE
+    ),
+
+    blocks_ge_0_1_n_percent = paste0(
+      format(
+        blocks_ge_0_1,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+      " (",
+      formatC(
+        percent_ge_0_1,
+        format = "f",
+        digits = 2
+      ),
+      "%)"
+    ),
+
+    blocks_ge_1_n_percent = paste0(
+      format(
+        blocks_ge_1,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+      " (",
+      formatC(
+        percent_ge_1,
+        format = "f",
+        digits = 2
+      ),
+      "%)"
+    )
+  ) %>%
+  transmute(
+    Endpoint = endpoint,
+
+    `Total blocks` =
+      total_blocks_formatted,
+
+    `Blocks >= 0.1, n (%)` =
+      blocks_ge_0_1_n_percent,
+
+    `Blocks >= 1, n (%)` =
+      blocks_ge_1_n_percent
+  )
+
+
+cumulative_hi_threshold_table
+
+
+write.csv(
+  cumulative_hi_threshold_table,
+  file = file.path(
+    output_dir,
+    "chlor_endpoint_cumulative_HI_threshold_table.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  cumulative_hi_threshold_table_raw,
+  file = file.path(
+    output_dir,
+    "chlor_endpoint_cumulative_HI_threshold_table_raw.csv"
+  ),
+  row.names = FALSE
+)
+
+```
+
+
+
+#for supplemental: table of summary information (n, min, median, mean, max, sd, se) for each chemical HQ for each HI for each endpoint and population (ch, ad, NA)
+```{r}
+
+# ============================================================
+# Calculate combined-HI summaries by endpoint and type
+#
+# Types:
+# - Child (air + drinking water)
+# - Adult (air + drinking water)
+# - Air only
+#
+# These categories are summarized independently.
+# No child-over-NA prioritization is applied here because the
+# purpose is to report each cumulative HI type separately.
+# ============================================================
+
+SQL_combined_hi_type_summary <- "
+WITH filtered_blocks AS (
+
+  SELECT DISTINCT
+    GEOID
+
+  FROM
+    `edf-aq-data.TSCA.filtblocks_chlor`
+),
+
+combined_hi AS (
+
+  SELECT
+    h.geoid20,
+
+    LOWER(
+      TRIM(h.endpoint)
+    ) AS endpoint,
+
+    LOWER(
+      TRIM(h.pop)
+    ) AS population_code,
+
+    h.HI_tot_comb AS value
+
+  FROM
+    `edf-aq-data.TSCA.chlor_combined_HIs` h
+
+  INNER JOIN
+    filtered_blocks f
+
+    ON h.geoid20 = f.GEOID
+
+  WHERE
+    LOWER(TRIM(h.pop)) IN (
+      'ch',
+      'ad',
+      'na'
+    )
+
+    AND h.endpoint IS NOT NULL
+    AND h.HI_tot_comb IS NOT NULL
+),
+
+aggregate_stats AS (
+
+  SELECT
+    endpoint,
+    population_code,
+
+    COUNT(value) AS n,
+
+    MIN(value) AS minimum,
+
+    AVG(value) AS mean,
+
+    MAX(value) AS maximum,
+
+    STDDEV_SAMP(value) AS sd
+
+  FROM
+    combined_hi
+
+  GROUP BY
+    endpoint,
+    population_code
+),
+
+median_stats AS (
+
+  SELECT DISTINCT
+    endpoint,
+    population_code,
+
+    PERCENTILE_CONT(
+      value,
+      0.5
+    ) OVER (
+      PARTITION BY
+        endpoint,
+        population_code
+    ) AS median
+
+  FROM
+    combined_hi
+)
+
+SELECT
+  a.endpoint,
+  a.population_code,
+  a.n,
+  a.minimum,
+  m.median,
+  a.mean,
+  a.maximum,
+  a.sd,
+
+  SAFE_DIVIDE(
+    a.sd,
+    SQRT(a.n)
+  ) AS se
+
+FROM
+  aggregate_stats a
+
+LEFT JOIN
+  median_stats m
+
+USING (
+  endpoint,
+  population_code
+)
+
+ORDER BY
+  endpoint,
+
+  CASE population_code
+    WHEN 'ch' THEN 1
+    WHEN 'ad' THEN 2
+    WHEN 'na' THEN 3
+    ELSE 4
+  END
+"
+
+
+combined_hi_type_summary_table <-
+  bq_project_query(
+    project_id,
+    SQL_combined_hi_type_summary
+  ) %>%
+  bq_table_download() %>%
+  transmute(
+    Endpoint = str_to_title(
+      endpoint
+    ),
+
+    `Cumulative HI type` = case_when(
+      population_code == "ch" ~
+        "Child (air + drinking water)",
+
+      population_code == "ad" ~
+        "Adult (air + drinking water)",
+
+      population_code == "na" ~
+        "Air only",
+
+      TRUE ~
+        population_code
+    ),
+
+    n = as.numeric(
+      n
+    ),
+
+    Minimum = as.numeric(
+      minimum
+    ),
+
+    Median = as.numeric(
+      median
+    ),
+
+    Mean = as.numeric(
+      mean
+    ),
+
+    Maximum = as.numeric(
+      maximum
+    ),
+
+    SD = as.numeric(
+      sd
+    ),
+
+    SE = as.numeric(
+      se
+    )
+  ) %>%
+  mutate(
+    `Cumulative HI type` = factor(
+      `Cumulative HI type`,
+      levels = c(
+        "Child (air + drinking water)",
+        "Adult (air + drinking water)",
+        "Air only"
+      )
+    )
+  ) %>%
+  arrange(
+    Endpoint,
+    `Cumulative HI type`
+  ) %>%
+  mutate(
+    `Cumulative HI type` = as.character(
+      `Cumulative HI type`
+    )
+  )
+
+
+combined_hi_type_summary_table
+
+
+# ============================================================
+# Validate combined-HI type summary
+#
+# All values should return FALSE.
+# ============================================================
+
+combined_hi_type_summary_validation <-
+  combined_hi_type_summary_table %>%
+  summarise(
+    any_n_below_1 =
+      any(
+        n < 1
+      ),
+
+    any_minimum_above_median =
+      any(
+        Minimum > Median
+      ),
+
+    any_median_above_maximum =
+      any(
+        Median > Maximum
+      ),
+
+    any_mean_below_minimum =
+      any(
+        Mean < Minimum
+      ),
+
+    any_mean_above_maximum =
+      any(
+        Mean > Maximum
+      ),
+
+    any_negative_sd =
+      any(
+        SD < 0,
+        na.rm = TRUE
+      ),
+
+    any_negative_se =
+      any(
+        SE < 0,
+        na.rm = TRUE
+      )
+  )
+
+
+combined_hi_type_summary_validation
+
+
+write.csv(
+  combined_hi_type_summary_table,
+  file = file.path(
+    output_dir,
+    "chlor_combined_HI_summary_by_endpoint_and_type.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+
+
+#table for supplemental on how many census blocks have HI of 0.1 or 1 exceedances for more than one endpoint
+```{r}
+
+# ============================================================
+# 1. Query multi-endpoint exceedance patterns
+# ============================================================
+
+SQL_multi_endpoint_exceedance_chlor <- "
+
+WITH filtered_blocks AS (
+
+  SELECT DISTINCT
+    GEOID
+
+  FROM
+    `edf-aq-data.TSCA.filtblocks_chlor`
+),
+
+
+-- ------------------------------------------------------------
+-- Select one cumulative HI per block-endpoint
+--
+-- Population priority:
+-- 1. child
+-- 2. NA / air-only
+-- ------------------------------------------------------------
+
+eligible_hi AS (
+
+  SELECT
+    h.geoid20,
+
+    LOWER(
+      TRIM(h.endpoint)
+    ) AS endpoint,
+
+    LOWER(
+      TRIM(h.pop)
+    ) AS pop,
+
+    h.HI_tot_comb,
+
+    ROW_NUMBER() OVER (
+
+      PARTITION BY
+        h.geoid20,
+        LOWER(TRIM(h.endpoint))
+
+      ORDER BY
+        CASE
+
+          WHEN LOWER(TRIM(h.pop)) = 'ch'
+            THEN 1
+
+          WHEN LOWER(TRIM(h.pop)) = 'na'
+            THEN 2
+
+          ELSE 3
+
+        END
+
+    ) AS population_rank
+
+  FROM
+    `edf-aq-data.TSCA.chlor_combined_HIs` h
+
+  INNER JOIN
+    filtered_blocks f
+
+    ON h.geoid20 = f.GEOID
+
+  WHERE
+    LOWER(TRIM(h.pop)) IN (
+      'ch',
+      'na'
+    )
+
+    AND h.endpoint IS NOT NULL
+
+    AND h.HI_tot_comb IS NOT NULL
+),
+
+
+-- ------------------------------------------------------------
+-- Keep selected population record
+-- ------------------------------------------------------------
+
+selected_hi AS (
+
+  SELECT
+    geoid20,
+    endpoint,
+    pop AS selected_population,
+    HI_tot_comb
+
+  FROM
+    eligible_hi
+
+  WHERE
+    population_rank = 1
+),
+
+
+-- ------------------------------------------------------------
+-- Define HI thresholds
+--
+-- threshold_id is INT64 and is used for grouping/windowing.
+-- threshold_value is the actual HI threshold.
+--
+-- Using threshold_id avoids BigQuery FLOAT64 PARTITION BY
+-- errors.
+-- ------------------------------------------------------------
+
+thresholds AS (
+
+  SELECT
+    1 AS threshold_id,
+    0.1 AS threshold_value
+
+  UNION ALL
+
+  SELECT
+    2 AS threshold_id,
+    1.0 AS threshold_value
+),
+
+
+-- ------------------------------------------------------------
+-- Identify every block-endpoint exceeding each threshold
+-- ------------------------------------------------------------
+
+exceeded_endpoints AS (
+
+  SELECT
+    h.geoid20,
+    t.threshold_id,
+    t.threshold_value,
+    h.endpoint
+
+  FROM
+    selected_hi h
+
+  CROSS JOIN
+    thresholds t
+
+  WHERE
+    h.HI_tot_comb >= t.threshold_value
+),
+
+
+-- ------------------------------------------------------------
+-- Determine total number and full combination of endpoints
+-- exceeded within each block
+-- ------------------------------------------------------------
+
+block_endpoint_patterns AS (
+
+  SELECT
+    geoid20,
+    threshold_id,
+    threshold_value,
+
+    COUNT(
+      DISTINCT endpoint
+    ) AS n_endpoints_exceeded,
+
+    STRING_AGG(
+      DISTINCT endpoint,
+      ', '
+      ORDER BY endpoint
+    ) AS endpoint_combination
+
+  FROM
+    exceeded_endpoints
+
+  GROUP BY
+    geoid20,
+    threshold_id,
+    threshold_value
+),
+
+
+-- ------------------------------------------------------------
+-- Expand each block into at-least-N categories
+--
+-- Example:
+-- If n_endpoints_exceeded = 4,
+-- create rows for:
+-- at_least_n = 1
+-- at_least_n = 2
+-- at_least_n = 3
+-- at_least_n = 4
+-- ------------------------------------------------------------
+
+at_least_endpoint_patterns AS (
+
+  SELECT
+    geoid20,
+    threshold_id,
+    threshold_value,
+    n_endpoints_exceeded,
+    endpoint_combination,
+    at_least_n
+
+  FROM
+    block_endpoint_patterns,
+
+  UNNEST(
+    GENERATE_ARRAY(
+      1,
+      n_endpoints_exceeded
+    )
+  ) AS at_least_n
+),
+
+
+-- ------------------------------------------------------------
+-- Count total blocks exceeding AT LEAST N endpoints
+-- ------------------------------------------------------------
+
+endpoint_number_totals AS (
+
+  SELECT
+    threshold_id,
+    threshold_value,
+    at_least_n,
+
+    COUNT(
+      DISTINCT geoid20
+    ) AS n_blocks
+
+  FROM
+    at_least_endpoint_patterns
+
+  GROUP BY
+    threshold_id,
+    threshold_value,
+    at_least_n
+),
+
+
+-- ------------------------------------------------------------
+-- Count full endpoint combinations among blocks in each
+-- at-least-N category
+-- ------------------------------------------------------------
+
+combination_counts AS (
+
+  SELECT
+    threshold_id,
+    threshold_value,
+    at_least_n,
+    endpoint_combination,
+
+    COUNT(
+      DISTINCT geoid20
+    ) AS n_blocks_combination
+
+  FROM
+    at_least_endpoint_patterns
+
+  GROUP BY
+    threshold_id,
+    threshold_value,
+    at_least_n,
+    endpoint_combination
+),
+
+
+-- ------------------------------------------------------------
+-- Rank endpoint combinations within each threshold and
+-- at-least-N category
+-- ------------------------------------------------------------
+
+ranked_combinations AS (
+
+  SELECT
+    threshold_id,
+    threshold_value,
+    at_least_n,
+    endpoint_combination,
+    n_blocks_combination,
+
+    DENSE_RANK() OVER (
+
+      PARTITION BY
+        threshold_id,
+        at_least_n
+
+      ORDER BY
+        n_blocks_combination DESC
+
+    ) AS combination_rank
+
+  FROM
+    combination_counts
+),
+
+
+-- ------------------------------------------------------------
+-- Retain the most common endpoint combination
+--
+-- If multiple combinations are tied for most common,
+-- all tied combinations are retained and separated by |
+-- ------------------------------------------------------------
+
+most_common_combinations AS (
+
+  SELECT
+    threshold_id,
+    threshold_value,
+    at_least_n,
+
+    STRING_AGG(
+      endpoint_combination,
+      ' | '
+      ORDER BY endpoint_combination
+    ) AS most_common_endpoints,
+
+    MAX(
+      n_blocks_combination
+    ) AS n_blocks_most_common
+
+  FROM
+    ranked_combinations
+
+  WHERE
+    combination_rank = 1
+
+  GROUP BY
+    threshold_id,
+    threshold_value,
+    at_least_n
+),
+
+
+-- ------------------------------------------------------------
+-- Total number of distinct Census blocks evaluated
+--
+-- Includes all blocks represented in selected_hi,
+-- regardless of whether they exceed either threshold.
+-- ------------------------------------------------------------
+
+total_blocks AS (
+
+  SELECT
+
+    COUNT(
+      DISTINCT geoid20
+    ) AS total_blocks
+
+  FROM
+    selected_hi
+)
+
+
+-- ------------------------------------------------------------
+-- Final query output
+-- ------------------------------------------------------------
+
+SELECT
+  t.threshold_value AS threshold,
+
+  t.at_least_n AS n_endpoints_exceeded,
+
+  b.total_blocks,
+
+  t.n_blocks,
+
+  m.most_common_endpoints,
+
+  m.n_blocks_most_common,
+
+  SAFE_MULTIPLY(
+    SAFE_DIVIDE(
+      m.n_blocks_most_common,
+      t.n_blocks
+    ),
+    100
+  ) AS percent_blocks_most_common
+
+FROM
+  endpoint_number_totals t
+
+LEFT JOIN
+  most_common_combinations m
+
+  ON
+    t.threshold_id =
+      m.threshold_id
+
+    AND t.at_least_n =
+      m.at_least_n
+
+CROSS JOIN
+  total_blocks b
+
+ORDER BY
+  t.threshold_id,
+  n_endpoints_exceeded
+"
+
+# ============================================================
+# 2. Run query and download raw long-format results
+# ============================================================
+
+multi_endpoint_exceedance_chlor_raw <-
+  bq_project_query(
+    project_id,
+    SQL_multi_endpoint_exceedance_chlor
+  ) %>%
+  bq_table_download() %>%
+  transmute(
+
+    threshold =
+      as.numeric(
+        threshold
+      ),
+
+    n_endpoints_exceeded =
+      as.numeric(
+        n_endpoints_exceeded
+      ),
+
+    total_blocks =
+      as.numeric(
+        total_blocks
+      ),
+
+    n_blocks =
+      as.numeric(
+        n_blocks
+      ),
+
+    most_common_endpoints =
+      as.character(
+        most_common_endpoints
+      ),
+
+    n_blocks_most_common =
+      as.numeric(
+        n_blocks_most_common
+      ),
+
+    percent_blocks_most_common =
+      as.numeric(
+        percent_blocks_most_common
+      )
+  ) %>%
+  arrange(
+    threshold,
+    n_endpoints_exceeded
+  )
+
+
+multi_endpoint_exceedance_chlor_raw
+
+# ============================================================
+# 3. Convert threshold results to wide format
+# ============================================================
+
+multi_endpoint_exceedance_chlor_wide_raw <-
+  multi_endpoint_exceedance_chlor_raw %>%
+
+  mutate(
+
+    threshold_label =
+      case_when(
+
+        dplyr::near(
+          threshold,
+          0.1
+        ) ~ "0_1",
+
+        dplyr::near(
+          threshold,
+          1
+        ) ~ "1",
+
+        TRUE ~
+          as.character(
+            threshold
+          )
+      )
+  ) %>%
+
+  select(
+    n_endpoints_exceeded,
+    total_blocks,
+    threshold_label,
+    n_blocks,
+    most_common_endpoints,
+    n_blocks_most_common,
+    percent_blocks_most_common
+  ) %>%
+
+  pivot_wider(
+
+    names_from =
+      threshold_label,
+
+    values_from = c(
+      n_blocks,
+      most_common_endpoints,
+      n_blocks_most_common,
+      percent_blocks_most_common
+    ),
+
+    names_glue =
+      "{.value}_{threshold_label}"
+  ) %>%
+
+  arrange(
+    n_endpoints_exceeded
+  )
+
+
+multi_endpoint_exceedance_chlor_wide_raw
+
+# ============================================================
+# 4. Fill missing threshold combinations
+# ============================================================
+
+multi_endpoint_exceedance_chlor_wide_raw <-
+  multi_endpoint_exceedance_chlor_wide_raw %>%
+
+  mutate(
+
+    n_blocks_0_1 =
+      replace_na(
+        n_blocks_0_1,
+        0
+      ),
+
+    n_blocks_1 =
+      replace_na(
+        n_blocks_1,
+        0
+      ),
+
+
+    most_common_endpoints_0_1 =
+      replace_na(
+        most_common_endpoints_0_1,
+        "None"
+      ),
+
+    most_common_endpoints_1 =
+      replace_na(
+        most_common_endpoints_1,
+        "None"
+      ),
+
+
+    n_blocks_most_common_0_1 =
+      replace_na(
+        n_blocks_most_common_0_1,
+        0
+      ),
+
+    n_blocks_most_common_1 =
+      replace_na(
+        n_blocks_most_common_1,
+        0
+      ),
+
+
+    percent_blocks_most_common_0_1 =
+      replace_na(
+        percent_blocks_most_common_0_1,
+        0
+      ),
+
+    percent_blocks_most_common_1 =
+      replace_na(
+        percent_blocks_most_common_1,
+        0
+      )
+  )
+
+
+multi_endpoint_exceedance_chlor_wide_raw
+
+# ============================================================
+# 5. Create formatted supplemental table
+# ============================================================
+
+multi_endpoint_exceedance_chlor <-
+  multi_endpoint_exceedance_chlor_wide_raw %>%
+
+  transmute(
+
+    `Chemical group` =
+      "Chlorinated solvents",
+
+
+    `Total number of Census blocks` =
+      format(
+        total_blocks,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+
+    `Number of endpoints exceeded (at least)` =
+      n_endpoints_exceeded,
+
+
+    `Number of Census blocks with HI >= 0.1` =
+      format(
+        n_blocks_0_1,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+
+    `Most common endpoints with HI >= 0.1` =
+      case_when(
+
+        most_common_endpoints_0_1 == "None" ~
+          "None",
+
+        TRUE ~
+          str_to_title(
+            most_common_endpoints_0_1
+          )
+      ),
+
+
+    `Blocks with most common HI >= 0.1 combination, n (%)` =
+      case_when(
+
+        n_blocks_0_1 == 0 ~
+          "0 (0.00%)",
+
+        TRUE ~
+          paste0(
+
+            format(
+              n_blocks_most_common_0_1,
+              big.mark = ",",
+              scientific = FALSE,
+              trim = TRUE
+            ),
+
+            " (",
+
+            formatC(
+              percent_blocks_most_common_0_1,
+              format = "f",
+              digits = 2
+            ),
+
+            "%)"
+          )
+      ),
+
+
+    `Number of Census blocks with HI >= 1` =
+      format(
+        n_blocks_1,
+        big.mark = ",",
+        scientific = FALSE,
+        trim = TRUE
+      ),
+
+
+    `Most common endpoints with HI >= 1` =
+      case_when(
+
+        most_common_endpoints_1 == "None" ~
+          "None",
+
+        TRUE ~
+          str_to_title(
+            most_common_endpoints_1
+          )
+      ),
+
+
+    `Blocks with most common HI >= 1 combination, n (%)` =
+      case_when(
+
+        n_blocks_1 == 0 ~
+          "0 (0.00%)",
+
+        TRUE ~
+          paste0(
+
+            format(
+              n_blocks_most_common_1,
+              big.mark = ",",
+              scientific = FALSE,
+              trim = TRUE
+            ),
+
+            " (",
+
+            formatC(
+              percent_blocks_most_common_1,
+              format = "f",
+              digits = 2
+            ),
+
+            "%)"
+          )
+      )
+  )
+
+
+multi_endpoint_exceedance_chlor
+
+# ============================================================
+# 6. Validate results
+#
+# All checks below should return FALSE.
+# ============================================================
+
+multi_endpoint_exceedance_chlor_validation <-
+  multi_endpoint_exceedance_chlor_wide_raw %>%
+
+  arrange(
+    n_endpoints_exceeded
+  ) %>%
+
+  summarise(
+
+    any_0_1_above_total =
+      any(
+        n_blocks_0_1 >
+          total_blocks
+      ),
+
+    any_1_above_total =
+      any(
+        n_blocks_1 >
+          total_blocks
+      ),
+
+
+    any_0_1_count_increases =
+      any(
+        diff(
+          n_blocks_0_1
+        ) > 0
+      ),
+
+    any_1_count_increases =
+      any(
+        diff(
+          n_blocks_1
+        ) > 0
+      ),
+
+
+    any_common_0_1_above_group_total =
+      any(
+        n_blocks_most_common_0_1 >
+          n_blocks_0_1
+      ),
+
+    any_common_1_above_group_total =
+      any(
+        n_blocks_most_common_1 >
+          n_blocks_1
+      ),
+
+
+    any_common_percent_0_1_above_100 =
+      any(
+        percent_blocks_most_common_0_1 >
+          100
+      ),
+
+    any_common_percent_1_above_100 =
+      any(
+        percent_blocks_most_common_1 >
+          100
+      )
+  )
+
+
+multi_endpoint_exceedance_chlor_validation
+
+# ============================================================
+# 7. Save formatted supplemental table
+# ============================================================
+
+write.csv(
+  multi_endpoint_exceedance_chlor,
+  file = file.path(
+    output_dir,
+    "chlor_multi_endpoint_HI_exceedance_table_wide.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 8. Save raw numeric version
+# ============================================================
+
+write.csv(
+  multi_endpoint_exceedance_chlor_wide_raw,
+  file = file.path(
+    output_dir,
+    "chlor_multi_endpoint_HI_exceedance_table_wide_raw.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+
+
+
+
+
+
